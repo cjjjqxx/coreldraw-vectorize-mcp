@@ -38,7 +38,7 @@ self-check that reports anything uncertain back to the calling AI so it can fix 
 ## 安装
 
 ```bash
-git clone https://github.com/cjjqxx/coreldraw-vectorize-mcp.git
+git clone https://github.com/cjjjqxx/coreldraw-vectorize-mcp.git
 ```
 
 ```bash
