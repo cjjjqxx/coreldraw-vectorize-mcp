@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.bak*
+
+# third-party binaries (download separately, see README)
+tools/
+
+# run outputs
+regress/runs/
+regress/holdout_runs/
+cdr-vectorize-work/
+*.cdr
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
