@@ -1,0 +1,7 @@
+mcp>=2.1            # MCP Python SDK 2.x (mcp.server.mcpserver.MCPServer)
+numpy>=1.26
+opencv-python>=4.8
+pillow>=10.0
+rapidocr-onnxruntime>=1.4
+onnxruntime>=1.17
+pywin32>=306        # CorelDRAW COM automation (Windows only)

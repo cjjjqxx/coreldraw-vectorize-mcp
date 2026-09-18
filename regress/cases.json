@@ -1,0 +1,8 @@
+[
+ {"id": "tibet_clean", "ref": "tibet_geo.png", "gt": "tibet_geo.json", "mode": "color", "degrade": []},
+ {"id": "tibet_small", "ref": "tibet_geo.png", "gt": "tibet_geo.json", "mode": "color", "degrade": [["resize", 0.64]]},
+ {"id": "tibet_jpeg",  "ref": "tibet_geo.png", "gt": "tibet_geo.json", "mode": "color", "degrade": [["jpeg", 30]]},
+ {"id": "well_clean",  "ref": "well_logging.png", "gt": "well_logging.json", "mode": "lineart", "degrade": []},
+ {"id": "well_blur",   "ref": "well_logging.png", "gt": "well_logging.json", "mode": "lineart", "degrade": [["blur", 1.3]]},
+ {"id": "well_small",  "ref": "well_logging.png", "gt": "well_logging.json", "mode": "lineart", "degrade": [["resize", 0.6]]}
+]
