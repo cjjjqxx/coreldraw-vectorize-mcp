@@ -84,14 +84,22 @@ def run_case(case, run_dir):
     cv2.imencode('.png', degrade(ref, case.get('degrade', [])))[1].tofile(str(inp))
     rec = {'id': case['id'], 'mode': case['mode'], 'degrade': case.get('degrade', [])}
     t0 = time.time()
-    res = cdr_server.cdr_vectorize(str(inp), str(work))          # the one-call MCP flow, no review
+    # The one-call MCP flow, no review. The tool itself now answers with content blocks (JSON text +
+    # inline pictures) and may hand back a running handle; the harness needs the payload dict of the
+    # finished job, so it calls the implementation behind the tool and polls it: the next stage is
+    # started by the status call, so waiting inside the first call alone would stall.
+    res = cdr_server._vectorize_impl(str(inp), str(work), wait_seconds=60)
+    while res.get('status') == 'running' and not res.get('done', True):
+        time.sleep(20)
+        res = cdr_server._job_status_impl(str(work))
     rec['seconds'] = round(time.time() - t0, 1)
     (cdir / 'mcp_result.json').write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding='utf-8')
     if not res.get('ok'):
         rec['error'] = {'step': res.get('step', 'mcp'), 'error': str(res.get('error'))[-600:]}
         return rec
     rec['mode_detected'] = res.get('mode')
-    rec['labels_used'] = len(res.get('labels', []))
+    _lb = res.get('labels', [])             # a count in the current payload, a list in older ones
+    rec['labels_used'] = _lb if isinstance(_lb, int) else len(_lb)
     rec['to_check'] = len(res.get('labels_to_check', []))
     rec['unlabeled'] = len(res.get('unlabeled_text', []))
     build = res

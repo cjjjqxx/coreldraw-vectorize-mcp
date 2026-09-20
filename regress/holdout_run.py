@@ -49,11 +49,15 @@ def main(run_id, names=None):
         print(f'[{time.strftime("%H:%M:%S")}] {name}', flush=True)
         t0 = time.time()
         try:
-            r = cdr_server.cdr_vectorize(p, str(work))
+            # the tool answers with content blocks and may return a running handle: use the payload
+            r = cdr_server._vectorize_impl(p, str(work), wait_seconds=60)
+            while r.get('status') == 'running' and not r.get('done', True):
+                time.sleep(20)
+                r = cdr_server._job_status_impl(str(work))
         except Exception as exc:  # noqa: BLE001
             r = {'ok': False, 'error': f'{type(exc).__name__}: {exc}', 'trace': traceback.format_exc()[-600:]}
         rec = {'seconds': round(time.time() - t0), 'ok': r.get('ok'), 'error': r.get('error'),
-               'mode': r.get('mode'), 'labels': len(r.get('labels', [])),
+               'mode': r.get('mode'), 'labels': (r.get('labels') if isinstance(r.get('labels'), int) else len(r.get('labels') or [])),
                'to_check': len(r.get('labels_to_check', [])), 'unlabeled': len(r.get('unlabeled_text', [])),
                'issues': [i.get('type') for i in r.get('issues', [])], 'self_check': r.get('self_check'),
                'needs_review': r.get('needs_review')}
