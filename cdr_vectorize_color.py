@@ -10,6 +10,7 @@ CLI: python cdr_vectorize_color.py layers <work_dir> <labels_confirmed.json> [co
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 
@@ -17,7 +18,9 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from cdr_vectorize import (S, erase_text, expand_to_text, imread, imwrite, _line_mask, _rule_mask,  # noqa: E402
+from cdr_vectorize import (S, MEASURED_TEXT, QUAD_WIPE, COLOUR_WIPE, DASH_PROTECT,  # noqa: E402
+                           annotate_placement, erase_text, expand_to_text, imread, imwrite,
+                           _line_mask, _rule_mask, _heal_crossings,
                            _split_box, _glyph_band, measure_text_h, is_bold, blur_factor, detect_latin_font)
 
 WHITE_MIN = 232          # a pixel whose channels are all above this counts as paper
@@ -125,12 +128,31 @@ def drop_region_rims(ink_mask, color_px):
     return out
 
 
-def drop_patch_outlines(ink_mask, color_px):
+def drop_patch_outlines(ink_mask, color_px, src_gray=None, text_zone=None):
     """Filled patches carry a 1-2 px darker outline that lands in the ink layer as long thin rims
     (drop_region_rims only catches short crumbs). Remove thin ink (no 5 px wide core) whose
     connected piece mostly hugs a colour patch; fault lines are thick and kept, and a small map
-    symbol that merely touches a patch is only partly near it, so it survives."""
+    symbol that merely touches a patch is only partly near it, so it survives.
+
+    On a map that is mostly filled regions, though, nearly every thin line hugs a patch, and "only
+    partly near it" does not save a symbol drawn INSIDE one. Whole map furniture went this way:
+    the inset's study-area rectangle, the place-name squares, dashed region boundaries, even parts
+    of the lettering - 127k px deleted against 122k kept. What the test cannot see is that a drawn
+    line is dark in the SOURCE while an SR rim is a mid-grey transition, so the decision is made per
+    pixel on the source, with the same "genuinely dark" bar split_faint_ink uses (L < 125). Flat
+    patch interiors are unaffected: their rims stay above it and are still dropped."""
     ink = (ink_mask > 0).astype(np.uint8)
+    keep = None if src_gray is None else (src_gray < 125)
+    zone = None if text_zone is None else (text_zone > 0)
+    reach = None
+    if keep is not None and zone is not None:
+        # whether each WHOLE ink structure shows anywhere outside the label boxes (judged on the full
+        # ink, not on the thin pieces: a frame's corners are thick and split its sides into pieces
+        # that each sit entirely inside a dense inset's boxes)
+        _ni, ink_cc = cv2.connectedComponents(ink, connectivity=8)
+        reach = np.zeros(_ni, bool)
+        reach[np.unique(ink_cc[~zone])] = True
+        reach[0] = False
     disk5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
     thick = cv2.dilate(cv2.morphologyEx(ink, cv2.MORPH_OPEN, disk5), disk5)
     thin = ink & (1 - thick)
@@ -142,6 +164,17 @@ def drop_patch_outlines(ink_mask, color_px):
         x, y, bw, bh, _ = st[i]
         comp = lab[y:y + bh, x:x + bw] == i
         if near[y:y + bh, x:x + bw][comp].mean() > 0.6:
+            if keep is not None:
+                k_ = keep[y:y + bh, x:x + bw]
+                # Inside a label box dark source pixels are usually the lettering itself: erase_text
+                # keeps long straight strokes as "lines" (the bars of 量 and 型), and this test is what
+                # cleared those leftovers - protecting them drew ghost strokes under every CJK label
+                # of a filled flowchart. A drawn line crossing the box (the inset rectangle behind
+                # "Depression") runs on out of it; a leftover stroke stays inside. So inside a box
+                # only pieces that reach beyond it keep their protection.
+                if reach is not None and not reach[ink_cc[y:y + bh, x:x + bw][comp]].any():
+                    k_ = np.zeros_like(k_)
+                comp = comp & ~k_
             out[y:y + bh, x:x + bw][comp] = 0
     return out
 
@@ -209,7 +242,7 @@ def split_faint_ink(ink_mask, cmasks, centers, src_bgr):
     return ink, faint, rgb, moved
 
 
-def patch_outline(src_bgr, mask, fill_rgb):
+def patch_outline(src_bgr, mask, fill_rgb, drawn=None):
     """Filled map patches carry a thin darker outline (dark olive around green, brown around orange).
     It was removed as ink noise and never drawn, so patches looked smaller and small ones - mostly
     outline - nearly vanished. Sample the source on a band across the patch boundary: if its darker
@@ -228,6 +261,26 @@ def patch_outline(src_bgr, mask, fill_rgb):
     rim_lab = cv2.cvtColor(np.uint8([[rim]]), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32)
     if fill_lab[0] - rim_lab[0] < 12:
         return None
+    if drawn is not None:
+        # The darkest quarter of the band is dark on any map whose patch borders are DRAWN - dashed
+        # boundaries, fault lines - and the outline then redrew every one of them as a solid dark
+        # contour (the geology map's dashed borders came out solid, its faults edged in brown). A
+        # patch outline is a line of its own: judge it only where no other layer already draws the
+        # border, and require it to be really there, a thin dark stroke along most of that stretch.
+        d1 = cv2.resize(drawn.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST)
+        d1 = cv2.dilate(d1, np.ones((7, 7), np.uint8)) > 0
+        edge = (m1 > 0) & ~(cv2.erode(m1, k3) > 0)
+        edge[:2, :] = edge[-2:, :] = False
+        edge[:, :2] = edge[:, -2:] = False
+        free = edge & ~d1
+        if free.sum() < 0.15 * max(int(edge.sum()), 1):
+            return None
+        L = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2LAB)[..., 0]
+        thin = (cv2.morphologyEx(L, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8)).astype(np.int16)
+                - L.astype(np.int16)) > 25
+        near = cv2.dilate(thin.astype(np.uint8), k3) > 0
+        if float(near[free].mean()) < 0.7:
+            return None
     return [int(rim[2]), int(rim[1]), int(rim[0])]
 
 
@@ -302,6 +355,659 @@ def rebuild_rules(grid_mask, max_tilt_deg=15.0, bridge=None, polylines=None):
             if polylines is not None:
                 polylines.append([int(v) for v in arr.reshape(-1)])
     return out
+
+
+def _split_mixed_colour(sub, core, cc, n, st):
+    """Split the dominant blob of a label box by hue when it is several drawn things of different colour.
+
+    Lettering that touches a line of another colour - blue "piedmont" sitting on a red fault line, with
+    a grey patch edge through it - comes out of the difference-from-background test as ONE component.
+    Its extent across the text line is then that of the line, it is rejected as "too big to be a
+    character", and the glyph height is estimated from the specks that are left (6 px for 45 px text):
+    the label is neither wiped nor measured. Colour tells the three apart where geometry cannot.
+
+    Only the one dominant component is touched, and only when its pixels fall into hue groups that are
+    genuinely different colours (a/b distance, lightness ignored). A single-colour word whose letters
+    merged has one hue and is left exactly as it was.
+    """
+    if n <= 1:
+        return cc, n, st
+    big = 1 + int(np.argmax(st[1:, 4]))
+    m = cc == big
+    if st[big][4] < 0.4 * float(core.sum()) or st[big][4] < 200:
+        return cc, n, st
+    ab = cv2.cvtColor(sub, cv2.COLOR_BGR2LAB)[m][:, 1:].astype(np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5)
+    _c, lbl, ctr = cv2.kmeans(ab, 3, None, crit, 3, cv2.KMEANS_PP_CENTERS)
+    lbl = lbl.ravel()
+    share = np.bincount(lbl, minlength=3) / float(lbl.size)
+    sig = [k for k in range(3) if share[k] > 0.1]
+    far = max((float(np.hypot(*(ctr[a] - ctr[b]))) for a in sig for b in sig if a < b), default=0.0)
+    if len(sig) < 2 or far < 25.0:
+        return cc, n, st
+    parts = np.zeros(core.shape, np.int32)
+    parts[m] = lbl + 1
+    out = np.where(m, 0, cc).astype(np.int32)
+    nxt = n
+    for k in range(3):
+        # Neutral parts (black frames, grey patch edges) are not this mask's business: dark neutral
+        # lettering is removed by erase_text in the ink layer, and a neutral line kept here would be
+        # wiped as if it were a letter (the frame around "nappe" was). They stay out, exactly as they
+        # did while they were buried in the rejected blob.
+        if float(np.hypot(ctr[k][0] - 128.0, ctr[k][1] - 128.0)) < 12.0:
+            continue
+        nk, ck = cv2.connectedComponents((parts == k + 1).astype(np.uint8), connectivity=8)
+        if nk > 1:
+            out[ck > 0] = ck[ck > 0] + nxt - 1
+            nxt += nk - 1
+    stats = np.zeros((nxt, 5), np.int32)
+    for i in range(1, nxt):
+        ys, xs = np.nonzero(out == i)
+        if xs.size:
+            stats[i] = [xs.min(), ys.min(), xs.max() - xs.min() + 1, ys.max() - ys.min() + 1, xs.size]
+    return out, nxt, stats
+
+
+def _own_hue(bgr, pen, rgb, S):
+    """Pixels under the pen printed in the label's own (chromatic) colour, plus their anti-aliased rim."""
+    ys, xs = np.nonzero(pen)
+    out = np.zeros(pen.shape, bool)
+    if rgb is None or max(rgb) - min(rgb) < 60 or xs.size == 0:
+        return out
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    lab = _lab(bgr[y0:y1, x0:x1]).astype(np.float32)
+    ref = _lab(np.array([[rgb[::-1]]], np.uint8)).astype(np.float32)[0, 0]
+    own = ((np.hypot(lab[..., 1] - 128.0, lab[..., 2] - 128.0) > 30)
+           & (np.hypot(lab[..., 1] - ref[1], lab[..., 2] - ref[2]) < 25)).astype(np.uint8)
+    out[y0:y1, x0:x1] = cv2.dilate(own, np.ones((2 * S + 1, 2 * S + 1), np.uint8)) > 0
+    return out
+
+
+def _foreign_hue(bgr, pen, rgb):
+    """Pixels under a label's wipe pen that are clearly drawn in ANOTHER colour than the label.
+
+    A fault line running along a label passes the glyph-height test together with the letters it
+    touches - across the text line it is exactly as tall as they are - so the whole run was wiped and
+    the red fault through blue "fault-fold" came back as fragments. The label's own colour is known by
+    now; strongly coloured pixels of a different hue are linework and stay. Only saturated pixels
+    count, so the pale patch under the text and the anti-aliased glyph edges are wiped as before.
+    """
+    ys, xs = np.nonzero(pen)
+    out = np.zeros(pen.shape, bool)
+    if rgb is None or xs.size == 0:
+        return out
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    lab = _lab(bgr[y0:y1, x0:x1]).astype(np.float32)
+    ref = _lab(np.array([[rgb[::-1]]], np.uint8)).astype(np.float32)[0, 0]
+    chroma = np.hypot(lab[..., 1] - 128.0, lab[..., 2] - 128.0)
+    dab = np.hypot(lab[..., 1] - ref[1], lab[..., 2] - ref[2])
+    out[y0:y1, x0:x1] = (chroma > 40) & (dab > 45)
+    return out & pen
+
+
+def glyph_mask_colour(bgr, labels, S, close_px=21, diff_thr=35, measure_only=False, split_for=(),
+                      foreign_out=None, own_hue_only=False, on_line_only=False):
+    """Pixels inside a label box that look like text, whatever colour that text is.
+
+    The wipe runs on the ink mask, so a coloured label sitting on a coloured patch is never wiped at
+    all - the palette calls it a "colour", not "ink" - and it comes back as ghost lettering traced
+    into the patch underneath. This finds those pixels by estimating the text-free background with a
+    closing wider than a stroke and taking the difference, then locking anything whose HEIGHT rules it
+    out as a character: a stroke is flat, a patch is tall, text matches the glyph height. Judging by
+    width instead would lock whole rotated words (one English word is many times wider than a
+    character), which is the mistake that left fragments of every long label behind.
+
+    Two jobs share this one pass over the glyph ink, hence `measure_only`:
+      * always - fill in each label's 'measured' run (length, glyph height, centre), which the font
+        sizing needs for labels an axis-aligned box cannot describe;
+      * unless measure_only - also return the mask, so the caller can widen the wipe to those glyphs.
+    """
+    h2, w2 = bgr.shape[:2]
+    out = np.zeros((h2, w2), np.uint8)
+    kbg = np.ones((close_px, close_px), np.uint8)
+    # Tried and rejected: dropping whole components that reach far outside the label box, to stop this
+    # mask (which feeds an inpaint, with no _heal_crossings behind it) from eating fault lines. It does
+    # remove 29% of the linework damage at what looked like no cost - but a label sitting ON a line
+    # shares one component with it, so Longmenshan / fault-fold / nappe lost their wipe and came back
+    # as coloured ghost lettering. Whole-component vetoes cannot work here: glyph and line are the same
+    # object by then. Anything better has to separate them before they are joined, not after.
+    for li, lab in enumerate(labels):
+        box = lab.get('box')
+        if not isinstance(box, (list, tuple)) or len(box) != 4:
+            continue
+        x0, y0, x1, y1 = (int(round(v)) for v in box)
+        x0, y0 = max(x0, 0), max(y0, 0)
+        x1, y1 = min(x1, w2 - 1), min(y1, h2 - 1)
+        if x1 - x0 < 8 or y1 - y0 < 8:
+            continue
+        # Bound everything to the detector's polygon when there is one: the axis-aligned box of a slanted
+        # label covers 1.67x the text area, and the surplus is linework that must not be wiped.
+        qm = None
+        if QUAD_WIPE and lab.get('quad'):
+            _f = np.zeros((h2, w2), np.uint8)
+            cv2.fillPoly(_f, [np.array([[int(round(p[0])), int(round(p[1]))] for p in lab['quad']],
+                                       np.int32)], 1)
+            qm = cv2.dilate(_f, np.ones((2 * S + 1, 2 * S + 1), np.uint8)) > 0
+        sub = bgr[y0:y1 + 1, x0:x1 + 1]
+        bg = cv2.morphologyEx(sub, cv2.MORPH_CLOSE, kbg)
+        core = (np.abs(sub.astype(np.int16) - bg.astype(np.int16)).max(axis=2) > diff_thr).astype(np.uint8)
+        core = cv2.morphologyEx(core, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        if qm is not None:
+            core = core & qm[y0:y1 + 1, x0:x1 + 1].astype(np.uint8)
+        if not core.any():
+            continue
+        h, w = core.shape
+        n, cc, st, _ = cv2.connectedComponentsWithStats(core, 8)
+        if li in split_for:
+            cc, n, st = _split_mixed_colour(sub, core, cc, n, st)
+        # Extent ACROSS the text line, not along the image axes.
+        # A slanted label is the case this has to survive: its glyph blobs are axis-aligned objects in no
+        # frame, so a run of slanted letters spans the box diagonally and the "2.4x glyph height" test
+        # rejects every one of them. That emptied the mask - and an empty mask is what left slanted
+        # labels BOTH unsized (so they were left blank) and unwiped (so their pixels survived as coloured
+        # residue traced into the patch). Measuring each blob across its own text line keeps the test
+        # meaningful at any angle. For near-horizontal labels this is exactly the old behaviour.
+        _ar = math.radians(float(lab.get('angle') or 0.0))
+        _across = None if abs(_ar) < 0.07 else (-math.sin(_ar), math.cos(_ar))
+
+        def _ext(comp, cx_, cy_):
+            """Blob extent across the text line, or None to keep using the axis-aligned height."""
+            if _across is None:
+                return None
+            ys_i, xs_i = np.nonzero(comp)
+            if xs_i.size == 0:
+                return 0.0
+            pv = (xs_i - cx_) * _across[0] + (ys_i - cy_) * _across[1]
+            return float(pv.max() - pv.min())
+
+        _eff = {}
+        for i in range(1, n):
+            if st[i][4] < 6:
+                continue
+            _e = _ext(cc == i, st[i][0] + st[i][2] / 2.0, st[i][1] + st[i][3] / 2.0)
+            _eff[i] = float(st[i][3]) if _e is None else _e
+        # Estimate the glyph height from the LARGEST components by area, not from all of them.
+        # Slivers along a patch edge or a rule outnumber the glyphs in a busy box, and a median over
+        # everything then lands on the 6 px floor - after which the 0.45..2.4x window below rejects the
+        # real glyphs. Measured coverage of each label's own ink was 0.33 on average that way (Chengdu
+        # 0.00, piedmont 0.05, fault-fold 0.02), which is exactly the coloured lettering that survives
+        # as ghost text inside the patches. Taking the median of the top third BY AREA - the glyphs are
+        # what dominates the area - lifts coverage to 0.83.
+        _pairs = [(_eff[i], float(st[i][4])) for i in _eff]
+        if _pairs:
+            _pairs.sort(key=lambda t: -t[1])
+            _top = _pairs[:max(3, len(_pairs) // 3)]
+            glyph_h = float(np.median([hh for hh, _a in _top]))
+        else:
+            glyph_h = h * 0.3
+        glyph_h = float(min(max(glyph_h, 6.0), 0.9 * h))
+        # the median blob size across the text line: unlike the span-based g it is not moved by a line
+        # running along the lettering, so it is what the font sizing uses to cap tracked-out labels
+        lab['run_gh'] = round(glyph_h, 2)
+        keep = np.zeros_like(core, bool)
+        for i in range(1, n):
+            _x, _y, ww, hh, _a = st[i]
+            hh_e = _eff.get(i, float(hh))
+            if hh_e < 0.45 * glyph_h or hh_e > 2.4 * glyph_h:
+                continue                            # a flat stroke, or far too big to be a character
+            if ww > 6.0 * glyph_h and hh_e < 0.7 * h:
+                continue                            # spans the box and stays flat: a rule line
+            keep |= cc == i
+        if not keep.any():
+            continue
+        if on_line_only and _across is not None:
+            # Pieces of a fault line in the corners of a slanted box pass the height test as well (their
+            # extent across the line is a glyph's), and the glyph-height span then took them in:
+            # Zhongjiang measured g = 99 for 25 px letters and was left blank. A slanted box is mostly
+            # off the text line, so a piece is kept only if it lies ON the line the bulk of the ink
+            # defines - the same rule pass 2 applies to what it adds.
+            ids = [i for i in range(1, n) if keep[cc == i].any()]
+            if len(ids) >= 3:
+                off = np.array([(st[i][0] + st[i][2] / 2.0) * _across[0] + (st[i][1] + st[i][3] / 2.0)
+                                * _across[1] for i in ids])
+                wts = np.array([float(st[i][4]) for i in ids])
+                o = np.argsort(off)
+                med = off[o][np.searchsorted(np.cumsum(wts[o]), 0.5 * wts.sum())]
+                for i, of_ in zip(ids, off):
+                    if abs(of_ - med) > 0.9 * glyph_h:
+                        keep[cc == i] = False
+            if not keep.any():
+                continue
+        # --- pass 2: follow the text line past the box edges.
+        # An OCR box is routinely shorter than the word it covers, and letters outside it sit inside no
+        # pen at all - which is why every long label came back as fragments of its own tail. Track the
+        # line the box already found and pick up glyph-shaped ink that continues it.
+        ang = math.radians(float(lab.get('angle') or 0.0))
+        ux, uy = math.cos(ang), math.sin(ang)          # along the line, image coordinates
+        ys1, xs1 = np.nonzero(keep)
+        cxm, cym = float(xs1.mean()) + x0, float(ys1.mean()) + y0
+        pj = (xs1 - xs1.mean()) * ux + (ys1 - ys1.mean()) * uy
+        half = float(max(abs(float(pj.min())), abs(float(pj.max())))) if pj.size else 0.0
+        reach = 1.5 * glyph_h
+        m = int(2 * glyph_h)
+        # The search area must ALWAYS contain the box itself: slicing with a box that reaches outside it
+        # raises, and a crashed layers step used to be masked by the stale file from the previous run.
+        EX0 = max(min(x0, int(cxm - half - reach - m)), 0)
+        EY0 = max(min(y0, int(cym - half - reach - m)), 0)
+        EX1 = min(max(x1 + 1, int(cxm + half + reach + m)), w2)
+        EY1 = min(max(y1 + 1, int(cym + half + reach + m)), h2)
+        pen = np.zeros((h2, w2), bool)
+        glyph_all = np.zeros((h2, w2), bool)
+        glyph_all[y0:y1 + 1, x0:x1 + 1] = keep
+        pen[y0:y1 + 1, x0:x1 + 1] = cv2.dilate(keep.astype(np.uint8), np.ones((3, 3), np.uint8),
+                                               iterations=2) > 0
+        if EX1 - EX0 > 8 and EY1 - EY0 > 8:
+            sub2 = bgr[EY0:EY1, EX0:EX1]
+            bg2 = cv2.morphologyEx(sub2, cv2.MORPH_CLOSE, kbg)
+            core2 = (np.abs(sub2.astype(np.int16) - bg2.astype(np.int16)).max(axis=2) > diff_thr).astype(np.uint8)
+            core2 = cv2.morphologyEx(core2, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+            n2, cc2, st2, _ = cv2.connectedComponentsWithStats(core2, 8)
+            grow = np.zeros_like(core2, bool)
+            for i in range(1, n2):
+                cxx, cyy, ww, hh, _a = st2[i]
+                # Same across-the-line rule as pass 1: pass 2 works in image coordinates too, so a
+                # slanted label's blobs must not be judged by their axis-aligned height here either.
+                if _across is None:
+                    hh_e = float(hh)
+                else:
+                    _c = cc2 == i
+                    _ys, _xs = np.nonzero(_c)
+                    if _xs.size == 0:
+                        continue
+                    _pv = ((_xs - (cxx + ww / 2.0)) * _across[0]
+                           + (_ys - (cyy + hh / 2.0)) * _across[1])
+                    hh_e = float(_pv.max() - _pv.min())
+                if hh_e < 0.45 * glyph_h or hh_e > 2.4 * glyph_h:
+                    continue                          # a stroke, or far too big to be a character
+                px, py = EX0 + cxx + ww / 2.0, EY0 + cyy + hh / 2.0
+                dx, dy = px - cxm, py - cym
+                if abs(dx * uy - dy * ux) > 0.9 * glyph_h:
+                    continue                          # off the text line
+                if abs(dx * ux + dy * uy) > half + reach:
+                    continue                          # too far along it: a neighbouring label
+                grow[cc2 == i] = True
+            if grow.any():
+                glyph_all[EY0:EY1, EX0:EX1] |= grow
+                pen[EY0:EY1, EX0:EX1] |= cv2.dilate(grow.astype(np.uint8), np.ones((3, 3), np.uint8),
+                                                    iterations=2) > 0
+        # --- measure the run itself, so the font size stops depending on how big the box is.
+        # fit_rotated_text() recovers the text length from the axis-aligned box, but that inversion is
+        # singular at 45 degrees (det = cos 2theta) and falls back to max(W,H) - the size then follows
+        # the box rather than the text, which is what turned every rotated label into a giant. Rotating
+        # to the label's own angle and projecting the glyph ink takes the box out of the equation.
+        if EY1 - EY0 > 8 and EX1 - EX0 > 8:
+            gloc = np.zeros((EY1 - EY0, EX1 - EX0), bool)
+            gloc[(y0 - EY0):(y1 + 1 - EY0), (x0 - EX0):(x1 + 1 - EX0)] = glyph_all[y0:y1 + 1, x0:x1 + 1]
+            ys_m, xs_m = np.nonzero(gloc)
+            # Height comes from the box interior only: the grown part runs along the text line and may
+            # have picked up a rule or a neighbouring label, which inflated the glyph height badly.
+            ys_k, xs_k = np.nonzero(keep)
+            if xs_m.size >= 24 and xs_k.size >= 16:
+                t = math.radians(float(lab.get('angle') or 0.0))
+                mux, muy = math.cos(t), math.sin(t)
+                mvx, mvy = -math.sin(t), math.cos(t)
+                pu = xs_m * mux + ys_m * muy
+                dxk = xs_k - float(xs_k.mean())
+                dyk = ys_k - float(ys_k.mean())
+                pvk = dxk * mvx + dyk * mvy
+
+                def _span(v, frac=0.8):
+                    """Width of the narrowest interval that holds `frac` of the samples.
+
+                    max-min is what a few stray pixels ruin. Fragments of a line or a patch edge inside
+                    the box stretched the measured glyph height to 115-230 px on labels whose text is
+                    ~30 px tall, and the sanity test below then discarded the measurement - which is why
+                    those labels came out blank on the sheet AND unwiped in the graphics. A trimmed span
+                    ignores the strays while still covering the real run.
+                    """
+                    if v.size == 0:
+                        return 0.0
+                    s = np.sort(v)
+                    k = max(1, int(frac * s.size))
+                    if s.size <= k:
+                        return float(s[-1] - s[0])
+                    return float((s[k:] - s[:s.size - k]).min())
+
+                meas_l = _span(pu)
+                meas_g = _span(pvk)
+                # A slanted box is mostly empty space, so a line crossing it inflates g without bound.
+                # A real glyph height stays well under half the box's short side, and a word is by
+                # definition longer than it is tall. A measurement failing either test is contaminated
+                # by linework and is dropped, which sends that label to the blank-for-a-human path.
+                short = min(x1 - x0, y1 - y0)
+                if (meas_l >= 4.0 and meas_g >= 3.0 and meas_g <= 0.55 * short
+                        and 1.4 <= meas_l / meas_g <= 15.0):
+                    lab['measured'] = {
+                        'L': round(meas_l, 2), 'g': round(meas_g, 2),
+                        'cx': round(float(xs_m.mean()) + EX0, 1),
+                        'cy': round(float(ys_m.mean()) + EY0, 1),
+                    }
+        mz = lab.get('measured')
+        if mz and not own_hue_only:
+            # Letters fused with a line of another colour are rejected whole by the shape test above
+            # and survived as blobs (the "me" of red Longmenshan on the black frame line). The run is
+            # measured by now, so every pixel of the label's own colour inside its text strip is a
+            # glyph: take those too.
+            strip = np.zeros((h2, w2), np.uint8)
+            rect = ((mz['cx'], mz['cy']), (mz['L'] + mz['g'], 2.2 * mz['g']),
+                    float(lab.get('angle') or 0.0))
+            cv2.fillPoly(strip, [cv2.boxPoints(rect).astype(np.int32)], 1)
+            pen |= _own_hue(bgr, strip > 0, lab.get('color'), S) & (strip > 0)
+        if qm is not None:
+            pen &= qm
+        if foreign_out is not None:
+            foreign_out |= _foreign_hue(bgr, pen, lab.get('color'))
+        if own_hue_only:
+            pen &= _own_hue(bgr, pen, lab.get('color'), S)
+        lab['wipe_colour_px'] = int(pen.sum())
+        if not measure_only:
+            out[pen] = 1
+    return out
+
+
+def line_strokes(mask, rgb):
+    """Centerline strokes for a colour layer that is nothing but thin lines (fault lines), or None.
+
+    Outline tracing (PowerTRACE's default) turns a 2 px red fault into a filled closed shape; with the
+    patch rim added it rendered as a brown-edged sausage. CorelDRAW's own guidance is that maps and line
+    drawings want CENTERLINE tracing - unfilled strokes - and the grey rules here are already redrawn
+    that way. A layer qualifies when opening it with a disk wider than a line leaves almost nothing
+    (it has no solid areas) and its area per centreline pixel - the mean line width - stays small.
+    The skeleton walk is the one in cdr_trace_skeleton (Zhang-Suen thinning, node-split paths).
+    """
+    m = (mask > 0).astype(np.uint8)
+    area = int(m.sum())
+    if area < 40 * S:
+        return None
+    solid = cv2.morphologyEx(m, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * S + 5, 2 * S + 5)))
+    if solid.sum() > 0.1 * area:
+        return None
+    # Lines are LONG. A layer of specks is thin too - on the JPEG Tibet map the dark-olive rims and dots
+    # of the small green patches passed the tests above, and as a "line" layer it was grown into the
+    # paper and repainted near-white, wiping ten patches. The fault layer of the geology map has all of
+    # its area in components over 15 px; that olive layer 17%.
+    n_, _, st_, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n_ > 1:
+        long_ = np.maximum(st_[1:, 2], st_[1:, 3]) >= 15 * S
+        if st_[1:, 4][long_].sum() < 0.7 * area:
+            return None
+    import cdr_trace_skeleton as sk
+    skel = sk.skeletonize(m * 255)
+    length = int(skel.sum())
+    if length == 0:
+        return None
+    width = area / float(length)
+    if width > 3.5 * S:
+        return None
+    polylines = []
+    for path in sk.trace_paths(skel):
+        if len(path) < 3 * S:
+            continue
+        ap = sk._simplify(path, 0.7 * S).reshape(-1, 2)
+        polylines.append([float(v) for xy in ap for v in xy])
+    if not polylines:
+        return None
+    return {'polylines': polylines, 'width_px': round(max(width, 1.0), 2), 'color': list(rgb)}
+
+
+def _left_square(src_gray, box, S, alone=False, gray_all=None):
+    """Right edge of a hollow square symbol at the left end of a horizontal label box, or None.
+
+    A square outline has ink in all four corners of its bounding box and a large rectangular hole;
+    the round letters that also enclose a hole (O, Q, o, d) leave their bbox corners empty, which
+    is what kept "Qinling" from losing its Q."""
+    # judged on the SOURCE: in the SR ink mask the little squares come out filled (Luojiang, Hui)
+    x0, y0, x1, y1 = (int(v // S) for v in box)
+    bh = y1 - y0
+    if bh < 6 or (not alone and x1 - x0 < 2 * bh):
+        return None
+    sub = (src_gray[y0:y1 + 1, x0:x1 + 1] < 140).astype(np.uint8)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(sub, 8)
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if (not alone and x > 0.3 * (x1 - x0)) or h < 0.4 * bh or h > 1.1 * bh or h < 6:
+            continue
+        if not 0.75 <= w / float(h) <= 1.33:
+            continue
+        comp = (cc[y:y + h, x:x + w] == i).astype(np.uint8)
+        filled = np.zeros_like(comp)
+        cnts, _ = cv2.findContours(comp, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(filled, cnts, -1, 1, -1)
+        if (filled.sum() - comp.sum()) < 0.35 * filled.sum():
+            continue                                    # not hollow
+        c = max(1, min(w, h) // 5)
+        corners = [comp[:c, :c], comp[:c, -c:], comp[-c:, :c], comp[-c:, -c:]]
+        if all(k.mean() > 0.3 for k in corners):
+            return int((x0 + x + w) * S)
+    # The outline test above needs the square as a component of its own. A fault line cutting it
+    # (Xindu) or a frame line touching it (Gaomiao) breaks that, but the square's HOLE survives: a
+    # small closing mends a 1-2 px cut, and a rectangular hole (a letter's hole is round: o, a, D fill
+    # 0.78-0.85 of their box) of about glyph size at the left end is the symbol.
+    # (on the plain grey here: a coloured line over the square's edge completes its ring)
+    if gray_all is not None:
+        sub = (gray_all[y0:y1 + 1, x0:x1 + 1] < 140).astype(np.uint8)
+    closed = cv2.morphologyEx(sub, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
+    n, cc, st, _ = cv2.connectedComponentsWithStats(1 - closed, 4)
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if x == 0 or y == 0 or x + w >= sub.shape[1] or y + h >= sub.shape[0]:
+            continue
+        if (not alone and x > 0.3 * (x1 - x0)) or h < 0.3 * bh or h > bh or h < 4:
+            continue
+        if not 0.7 <= w / float(h) <= 1.4 or a < 0.88 * w * h:
+            continue
+        ring = closed[y + h // 2, x + w:min(x + w + max(3, h // 3), sub.shape[1])]
+        t = int(np.argmin(ring)) if (ring == 0).any() else len(ring)
+        return int((x0 + x + w + t) * S)
+    return None
+
+
+def text_colour(src_bgr, box):
+    """The colour a label is printed in, sampled on the source from its separated foreground.
+
+    The old sample looked only at INK components, so a coloured label - blue on a blue basin, red along
+    a nappe - had no pixels to sample and fell back to black: almost every coloured label of the
+    geology map came out black. Layered text-editing pipelines (detect -> segment foreground -> restore
+    background -> redraw) take the colour from the segmented foreground instead, and so does this: the
+    pixels that stand out from a closing-estimated background, minus pieces running out of the box
+    (a line crossing it). Returns RGB, or None when the box holds too little foreground to judge;
+    the caller keeps its own ink sample for neutral lettering (see there).
+    """
+    x0, y0, x1, y1 = (int(round(v)) for v in box)
+    H, W = src_bgr.shape[:2]
+    x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, W - 1), min(y1, H - 1)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return None
+    p = 12
+    X0, Y0, X1, Y1 = max(x0 - p, 0), max(y0 - p, 0), min(x1 + p, W), min(y1 + p, H)
+    win = src_bgr[Y0:Y1, X0:X1]
+    sub = win.astype(np.int16)
+    bg = cv2.morphologyEx(win, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8)).astype(np.int16)
+    diff = np.abs(sub - bg).max(axis=2)
+    core = (diff > 40).astype(np.uint8)
+    n, cc, st, _ = cv2.connectedComponentsWithStats(core, 8)
+    keep = np.zeros(core.shape, bool)
+    edge = np.zeros(core.shape, bool)
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if a < 3:
+            continue
+        if x <= 0 or y <= 0 or x + w >= core.shape[1] or y + h >= core.shape[0]:
+            edge |= cc == i
+            continue
+        keep |= cc == i
+    # A line crossing the lettering fuses with it into one component that runs out of the window, and
+    # dropping it threw the whole label away: blue "fault-fold" on a red fault kept only the black
+    # dashes nearby and came out black. When the in-box pieces are the minor part, take the fused
+    # component's pixels inside the box too; the colour clustering below separates line from glyphs.
+    inner = np.zeros(core.shape, bool)
+    inner[y0 - Y0:y1 - Y0 + 1, x0 - X0:x1 - X0 + 1] = True
+    edge &= inner
+    if int(edge.sum()) > 2 * int(keep.sum()):
+        keep |= edge
+    if int(keep.sum()) < 8:
+        return None
+    px = sub[keep].astype(np.float32)
+    lab = cv2.cvtColor(win, cv2.COLOR_BGR2LAB)[keep].astype(np.float32)
+    chroma = np.hypot(lab[:, 1] - 128.0, lab[:, 2] - 128.0)
+    colourful = chroma > 25
+    if colourful.mean() >= 0.3:
+        # coloured lettering: the median of its coloured pixels, so a black frame or fault line
+        # sharing the box cannot drag a blue label to black; a coloured line through a coloured label
+        # (red fault through blue text) is split off by hue - the lettering is the larger cluster
+        cp, ab = px[colourful], lab[colourful][:, 1:3]
+        if len(cp) >= 20:
+            _, lbl, _ = cv2.kmeans(ab.astype(np.float32), 2, None,
+                                   (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.5), 3,
+                                   cv2.KMEANS_PP_CENTERS)
+            lbl = lbl.ravel()
+            big = int(np.bincount(lbl, minlength=2).argmax())
+            ca, cb = ab[lbl == big].mean(0), ab[lbl != big].mean(0) if (lbl != big).any() else None
+            if cb is not None and np.hypot(*(ca - cb)) > 25:
+                cp = cp[lbl == big]
+        c = np.median(cp, axis=0)
+    else:
+        # black or grey lettering: small strokes are 1-2 px and anti-aliased, so no pixel reaches the
+        # true ink and a median comes out grey (西宁 122 for black print); the darkest tenth is the ink
+        dark = px[np.argsort(px.sum(axis=1))[:max(1, len(px) // 10)]]
+        c = dark.mean(axis=0)
+    return [int(c[2]), int(c[1]), int(c[0])]
+
+
+def colour_core(bgr, close_px=21, diff_thr=35):
+    """Everything that is not flat background: linework, patch edges and lettering alike.
+
+    Same test glyph_mask_colour uses per box, run on the whole image - a closing wider than a stroke
+    estimates the background, and what stands out from it is drawn content."""
+    bg = cv2.morphologyEx(bgr, cv2.MORPH_CLOSE, np.ones((close_px, close_px), np.uint8))
+    core = (np.abs(bgr.astype(np.int16) - bg.astype(np.int16)).max(axis=2) > diff_thr).astype(np.uint8)
+    return cv2.morphologyEx(core, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)) > 0
+
+
+def heal_colour_crossings(bgr_orig, bgr, wiped, labels, glyph_ink=None):
+    """Put back the lines and patch edges the colour wipe cut through.
+
+    erase_text answers "the wipe ate a line" with _heal_crossings: wipe conservatively, then reconnect
+    what was cut. The colour wipe never had that second half - it hands its mask straight to an inpaint,
+    so a fault line crossing a label box is gone for good. Every attempt to make the MASK smarter fails
+    on the same wall: inside the box a glyph and the line it sits on are one connected object, and
+    dropping that object un-wipes the label (measured: Longmenshan / fault-fold / nappe came back as
+    coloured ghost lettering). Healing sidesteps it entirely - it never has to tell glyph from line,
+    it only needs the line to still exist on BOTH sides of the gap, which a glyph never does.
+
+    Feeds _heal_crossings binary stand-ins so the author's tested geometry (stub pairing, collinearity,
+    "was this dark in the original") is reused rather than reinvented.
+    """
+    structure = colour_core(bgr_orig)
+    img = np.where(structure, 0, 255).astype(np.uint8)                    # the drawing before the wipe
+    # Only structure OUTSIDE the label boxes may act as a stub. _heal_crossings joins collinear stub
+    # pairs, and the letters of a word are collinear by construction - the ink wipe never meets that
+    # case because it clears a whole box at once and leaves no letter behind, but this mask is glyph
+    # shaped and imperfect, so its leftovers seeded bridges and drew rows of letters back in (seen on
+    # piedmont). A line crossing a box has ends on both sides of it; a leftover letter does not.
+    inside = np.zeros(structure.shape, bool)
+    for lab in labels:
+        x0, y0, x1, y1 = (int(v) for v in lab['box'])
+        inside[max(y0, 0):y1 + 1, max(x0, 0):x1 + 1] = True
+    out = np.where(structure & (wiped == 0) & ~inside, 0, 255).astype(np.uint8)
+    # _heal_crossings looks for stubs entering one window, so the window has to match the damage.
+    # A label box is the right window for the ink wipe, which cuts one box-sized hole; the colour
+    # wipe instead nibbles a line wherever a glyph crossed it, leaving many small gaps inside the
+    # box that no box-sized window resolves (per-box healing alone recovered 4.8%, per-gap 12.1%).
+    # So each gap is offered as its own window, then the boxes, then the gaps again - bridging one
+    # gap creates the stub that lets the next one pair up. It converges after that.
+    n, _, st, _ = cv2.connectedComponentsWithStats(wiped, 8)
+    gaps = [{'box': [int(st[i][0]), int(st[i][1]), int(st[i][0] + st[i][2]), int(st[i][1] + st[i][3])]}
+            for i in range(1, n)]
+    healed = out.copy()
+    for window in (gaps, labels, gaps):
+        healed = _heal_crossings(img, healed, window)
+    # only pixels the wipe actually took: everything else in bgr is already the original
+    back = (healed < 200) & (out >= 200) & (wiped > 0)
+    if glyph_ink is not None:
+        # A bridge runs straight between two stubs, and a fault line often runs almost parallel to the
+        # label it crosses - so the path grazes the lettering and restored it as a dotted trail along
+        # the old baseline. erase_text already ruled those exact pixels to be this label's glyphs, so
+        # they are never a line worth putting back, whatever the geometry says.
+        back &= ~glyph_ink
+    # The same trail in COLOURED lettering is invisible to that test - coloured glyphs are not in the
+    # ink layer, which is the very reason the colour mask exists. But glyph_mask_colour already
+    # measured where each label's lettering runs, so the band it occupies is known and nothing inside
+    # it is ever restored. No glyph-versus-line decision is needed: the band is simply off limits.
+    band = np.zeros(structure.shape, np.uint8)
+    for lab in labels:
+        m = lab.get('measured') or {}
+        if m:
+            t = math.radians(float(lab.get('angle') or 0.0))
+            ux, uy = math.cos(t), math.sin(t)
+            half_l, half_g = float(m['L']) / 2 + float(m['g']), float(m['g'])
+            cx, cy = float(m['cx']), float(m['cy'])
+            pts = [(cx + ux * a - (-uy) * b, cy + uy * a - ux * b)
+                   for a, b in ((-half_l, -half_g), (half_l, -half_g), (half_l, half_g), (-half_l, half_g))]
+            cv2.fillPoly(band, [np.array([[int(round(p)), int(round(q))] for p, q in pts], np.int32)], 1)
+        else:
+            x0, y0, x1, y1 = (int(v) for v in lab.get('tight', lab['box']))
+            band[max(y0, 0):y1 + 1, max(x0, 0):x1 + 1] = 1
+    back &= band == 0
+    n = int(back.sum())
+    if n:
+        bgr = bgr.copy()
+        bgr[back] = bgr_orig[back]
+    return bgr, n
+
+
+def _run_ratio(lab):
+    """(L/g) per character of a label's measured run, or None - a font constant, not a size."""
+    m = lab.get('measured') or {}
+    text = lab.get('text') or ''
+    n_cjk = sum(1 for ch in text if '⺀' <= ch <= '￯')
+    n_eff = n_cjk + 0.5 * max(len(text) - n_cjk, 0)
+    if not m or n_eff <= 0 or not m.get('g'):
+        return None
+    return float(m['L']) / float(m['g']) / n_eff
+
+
+def glyph_mask_colour_best(bgr, labels, S, measure_only=False, foreign_out=None):
+    """glyph_mask_colour, with the hue split applied only to the labels it demonstrably repairs.
+
+    Splitting by hue rescues lettering fused to a line of another colour, but on a box holding many
+    colours it can also hand the measurement a rim or a line fragment (Longmenshan's glyph height went
+    from 32 to 115). The OCR text says how long a run should be for its height: over the 47 horizontal
+    labels of the geology map (L/g)/characters spans 1.06-3.06. A label is split only when its plain
+    measurement is outside that range (or missing) and the split one falls inside it; a label already
+    measured sensibly is never touched. Returns (mask, number of labels split).
+    """
+    def ok(r):
+        return r is not None and 1.0 <= r <= 3.1
+    plain = [dict(l) for l in labels]
+    glyph_mask_colour(bgr, plain, S, measure_only=True)
+    trial = [dict(l) for l in labels]
+    glyph_mask_colour(bgr, trial, S, measure_only=True, split_for=range(len(labels)))
+    chosen = {i for i, (a, b) in enumerate(zip(plain, trial))
+              if a.get('text') and not ok(_run_ratio(a)) and ok(_run_ratio(b))}
+    mask = glyph_mask_colour(bgr, labels, S, measure_only=measure_only, split_for=chosen,
+                             foreign_out=foreign_out)
+    # Rescue only: a label still unmeasured is measured again keeping only the ink ON its text line.
+    # Applied to every label this also moved good measurements (piedmont's fused glyph+fault run
+    # dragged the line centre off the text), so it may only fill in what is missing, and only with a
+    # run whose length per character is plausible.
+    miss = [i for i, l in enumerate(labels) if l.get('text') and not l.get('measured')]
+    if miss:
+        again = [dict(labels[i]) for i in miss]
+        glyph_mask_colour(bgr, again, S, measure_only=True, on_line_only=True)
+        for i, l in zip(miss, again):
+            if l.get('measured') and ok(_run_ratio(l)):
+                labels[i]['measured'] = l['measured']
+    if not measure_only:
+        # The WIPE takes the split glyphs of every label, not only of those whose measurement it
+        # repairs: a red "n" of Longmenshan fused with the black frame line, or the blue "c" of
+        # Xinchang fused with a boundary, is rejected whole by the shape test and survived as a
+        # blob. Only pixels in the label's own colour are added, so a rim or a line fragment that
+        # the split mis-measures cannot widen the wipe.
+        mask |= glyph_mask_colour(bgr, [dict(l) for l in labels], S, split_for=range(len(labels)),
+                                  own_hue_only=True)
+    return mask, len(chosen)
 
 
 def color_masks(bgr, idx, centers, kinds, ink_dil, min_area):
@@ -425,7 +1131,8 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
     ink_mask = thicken_ink(bgr, ink_mask)
     ink_dil0 = cv2.dilate(ink_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * S + 3, 2 * S + 3)))
     color_px = np.zeros((h2, w2), bool)
-    for m_ in color_masks(bgr, idx, centers, kinds, ink_dil0, min_area).values():
+    cmasks_pre = color_masks(bgr, idx, centers, kinds, ink_dil0, min_area)
+    for m_ in cmasks_pre.values():
         color_px |= m_ > 0
     ink_mask = drop_region_rims(ink_mask, color_px)
 
@@ -435,9 +1142,9 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
     cand_path = os.path.join(work_dir, 'ocr_candidates.json')
     cands = json.load(open(cand_path, encoding='utf-8')).get('candidates', []) if os.path.exists(cand_path) else []
 
-    def _angle_for(box_src):
-        """angle for a confirmed label: from its own field, else nearest OCR candidate by IoU."""
-        best, bi = 0.0, 0.0
+    def _match(box_src):
+        """Angle and detector polygon for a confirmed label, from the nearest OCR candidate by IoU."""
+        best_a, best_q, bi = 0.0, None, 0.0
         for cd in cands:
             b = cd['box']
             ix = max(0, min(box_src[2], b[2]) - max(box_src[0], b[0]))
@@ -445,19 +1152,64 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
             inter = ix * iy
             u = (box_src[2]-box_src[0])*(box_src[3]-box_src[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter + 1e-9
             if inter/u > bi:
-                bi, best = inter/u, float(cd.get('angle', 0.0))
-        return best if bi > 0.2 else 0.0
+                bi, best_a, best_q = inter/u, float(cd.get('angle', 0.0)), cd.get('quad')
+        if bi <= 0.2:
+            return 0.0, None
+        return best_a, best_q
 
     ink_gray = np.where(ink_mask > 0, 0, 255).astype(np.uint8)
     ink_nh = ink_mask & (1 - _rule_mask(ink_mask))
     labels = []
+    src_gray0 = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2GRAY)
+    src_gray_all = src_gray0.copy()
+    # the place-name squares are black: a red fault running into one (Gaomiao) must not join it
+    src_gray0[(src_bgr.max(axis=2).astype(np.int16) - src_bgr.min(axis=2)) > 60] = 255
     for c in confirmed or []:
         text = str(c['text']).strip()
-        if not text:
+        erase_only = bool(c.get('erase_only'))
+        if not text and not erase_only:
             continue
         box = [int(v) * S for v in c['box']]
         box = [max(box[0], 0), max(box[1], 0), min(box[2], w2 - 1), min(box[3], h2 - 1)]
-        ang = float(c['angle']) if 'angle' in c else _angle_for([int(v) for v in c['box']])
+        auto_ang, quad_src = _match([int(v) for v in c['box']])
+        ang = float(c['angle']) if 'angle' in c else auto_ang
+        # A tall box read with angle 0 is rotated Latin text: the detector's polygon has a short flat
+        # top edge, so its slant comes out 0, but RapidOCR turns any crop 1.5x taller than wide by 90
+        # degrees counter-clockwise before reading it - a correct read therefore means the text runs
+        # bottom-to-top, which is -90 here. Laid flat instead, "Longquanshan tectonic belt" became a
+        # one-line sliver and a misread vertical coordinate a giant "0". (CJK is excluded: upright
+        # characters stacked top-to-bottom are a different layout.)
+        _bw, _bh = c['box'][2] - c['box'][0], c['box'][3] - c['box'][1]
+        if (abs(ang) <= 4 and _bh >= 1.5 * _bw and len(text) >= 1
+                and not any('⺀' <= ch <= '￯' for ch in text)):
+            ang = -90.0
+        # the detector polygon, in working pixels: the wipe is bounded by this rather than by the box,
+        # which for a slanted label covers 1.67x the text area and drags linework into the wipe
+        # The polygon is carried whatever QUAD_WIPE says: bounding the wipe to it is still off by
+        # default, but _measured_band uses its THICKNESS to cap the text strip (a line crossing the
+        # lettering inflates the measured glyph height, and the strip then covers the whole box).
+        quad = [[float(p[0]) * S, float(p[1]) * S] for p in quad_src] if quad_src else None
+        if erase_only:
+            # wiped from the ink layer so no ghost is traced, but no text object: a human types it
+            labels.append({'text': '', 'box': box, 'angle': ang, 'erase_only': True, 'quad': quad})
+            continue
+        # A map's place-name symbol - the small hollow square before "Pixian" - is read by OCR as 口
+        # (alone, or glued to the name) and its box swallows it. It was then wiped as lettering and
+        # retyped as the glyph 口, which the font draws like 二 or 工, while the name was sized to the
+        # symbol-plus-word width. The symbol is graphics: leave it in the drawing, keep it out of the box.
+        sq = None
+        if abs(ang) <= 4:
+            if text in ('口', '□'):
+                # a lone 口 in a square box is the symbol itself, also when a line crossing it keeps
+                # the outline test from recognising it (three of the five on the geology map)
+                bw_, bh_ = box[2] - box[0], box[3] - box[1]
+                if (_left_square(src_gray0, box, S, alone=True, gray_all=src_gray_all) is not None
+                        or (bh_ > 0 and 0.75 <= bw_ / float(bh_) <= 1.33)):
+                    continue
+            sq = _left_square(src_gray0, box, S, gray_all=src_gray_all)
+            if sq is not None and len(text) > 1:
+                text = text.lstrip('口□ ').strip() or text
+                box = [min(sq + 2 * S, box[2] - 1), box[1], box[2], box[3]]
         parts = [p.strip() for p in text.split('|') if p.strip()]
         if len(parts) > 1:
             for p, sub in zip(parts, _split_box(ink_nh, box, parts)):
@@ -466,7 +1218,13 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
             # a slanted OCR box already spans the whole rotated label; growing it sideways swallows
             # neighbouring numerals and fault lines
             grown = box if abs(ang) > 4 else expand_to_text(ink_nh, box, len(text))
-            labels.append({'text': text, 'box': grown, 'angle': ang})
+            if sq is None and abs(ang) <= 4 and grown[0] < box[0]:
+                # the box grew left: the square just outside the OCR box (Xindu) is glyph-shaped
+                # enough for expand_to_text to take it in, and it was wiped with the name
+                sq = _left_square(src_gray0, grown, S, gray_all=src_gray_all)
+            if sq is not None:                       # growing must not take the symbol back in
+                grown = [max(grown[0], min(sq + 2 * S, grown[2] - 1))] + list(grown[1:])
+            labels.append({'text': text, 'box': grown, 'angle': ang, 'quad': quad})
     # label colour is sampled at SOURCE scale: SR sharpens glyph cores far darker than the original
     # print, while a median over the SR mask is dominated by grey anti-aliased flanks (too pale)
     bgr1 = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
@@ -487,14 +1245,92 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
         sub = bgr1[y0 // S:y0 // S + g1.shape[0], x0 // S:x0 // S + g1.shape[1]]
         g1 = g1[:sub.shape[0], :sub.shape[1]]
         px = sub[g1 & (sub.min(axis=2) < 200)]
-        if len(px):
+        fg = text_colour(src_bgr, [v / S for v in lab_['box']])
+        # Coloured lettering is not in the ink layer, so only the foreground sample can see it. Black
+        # lettering is, and the ink sample below reads it darker (on the sharpened SR image) than the
+        # source's anti-aliased strokes allow - so neutral labels keep the ink sample when there is one.
+        neutral = fg is None or max(fg) - min(fg) < 20
+        if fg is not None and not (neutral and len(px)):
+            c = np.array(fg[::-1], np.float64)                  # BGR
+        elif len(px):
             dark = px[np.argsort(px.astype(np.int32).sum(axis=1))[:max(1, len(px) // 10)]]
             c = dark.mean(axis=0)
         else:
             c = np.array([0, 0, 0])
         lab_['color'] = [int(c[2]), int(c[1]), int(c[0])]     # RGB
     ink_mask0 = ink_mask.copy()          # before wiping: defines what counts as an edge halo
-    cleaned_gray = erase_text(ink_gray, labels) if labels else ink_gray
+    # Dashed rules are runs of short segments, and a short segment looks exactly like a character stroke,
+    # so the wipe eats the dashes crossing a label box. Find them first and keep those pixels. This is
+    # the same protection the lineart path applies - the colour path used to miss it entirely, so
+    # DASH_PROTECT silently had no effect on every colour build.
+    protect = None
+    if labels and DASH_PROTECT:
+        try:
+            import dash_protect
+
+            protect, _dash_info = dash_protect.build_protect_mask(
+                ink_gray.shape, dash_protect.find_dashes(ink_gray, bgr),
+                confs=('high',), mode='ink', margin=2,
+                ink=(dash_protect.ink_layer(ink_gray, bgr) > 0))
+        except Exception:  # noqa: BLE001 - optional protection, must never be why the wipe fails
+            protect = None
+    # A coloured label has no glyphs in the INK layer - only the dark rim of its letters - so wiping
+    # its whole text strip there removes nothing but the black linework crossing it (the staircase
+    # frame through red "nappe" lost 160 px). Its ink wipe is limited to pixels next to strongly
+    # coloured ones; black labels are wiped exactly as before.
+    _lab_all = _lab(bgr).astype(np.float32)
+    # (the rim of a red letter is dark red, a black line crossing it stays neutral right up to it)
+    colour_near = (np.hypot(_lab_all[..., 1] - 128.0, _lab_all[..., 2] - 128.0) > 20)
+    # Measure every label's run BEFORE the wipe, not after it. The wipe's own idea of where a slanted
+    # label's text lies is an inversion of its axis-aligned box, which is singular near 45 degrees and
+    # then fell back to wiping the WHOLE box: the map boundary crossing "E Xiang Qian Fold Belt" was
+    # deleted, and that label is left blank, so the drawing lost linework and gained nothing. The
+    # measured run gives the strip directly. Costs one extra measuring pass over the labels.
+    if MEASURED_TEXT and labels:
+        try:
+            glyph_mask_colour_best(bgr, labels, S, measure_only=True)
+        except Exception:  # noqa: BLE001 - a better wipe bound must never be why a build fails
+            pass
+    cleaned_gray = (erase_text(ink_gray, labels, protect=protect, colour_near=colour_near)
+                    if labels else ink_gray)
+    # Coloured lettering printed OVER a black line cuts it: the ink layer never had those pixels, so
+    # once the letters are gone the frame line has holes where they stood (red "Longmenshan" on the
+    # staircase frame). _heal_crossings bridges collinear stubs only across a path that was dark, so it
+    # is shown the occluded view - the label's own-colour glyph pixels count as dark - and restores
+    # the line through them at the line's own grey.
+    occl = ink_gray.copy()
+    col_labels = []
+    for lab_ in labels:
+        c_ = lab_.get('color')
+        if not c_ or max(c_) - min(c_) <= 60:
+            continue
+        ref = _lab(np.array([[c_[::-1]]], np.uint8)).astype(np.float32)[0, 0]
+        bx0, by0, bx1, by1 = (int(v) for v in lab_['box'])
+        bx0, by0 = max(bx0, 0), max(by0, 0)
+        sl = _lab_all[by0:by1 + 1, bx0:bx1 + 1]
+        own = ((np.hypot(sl[..., 1] - 128.0, sl[..., 2] - 128.0) > 30)
+               & (np.hypot(sl[..., 1] - ref[1], sl[..., 2] - ref[2]) < 25))
+        if own.any():
+            line_grey = int(np.median(ink_gray[ink_gray < 200])) if (ink_gray < 200).any() else 0
+            occl[by0:by1 + 1, bx0:bx1 + 1][own] = line_grey
+            col_labels.append(lab_)
+    if col_labels:
+        cleaned_gray = _heal_crossings(occl, cleaned_gray, col_labels)
+    for lab_ in labels:
+        # erase_text derives 'tight' from the glyph core in the INK image. A vertical label printed in
+        # colour has no core there - Longquanshan tectonic belt kept the lower half of its run plus the
+        # faults beside it, and came out at 7 pt, anchored 100 px low. For a vertical run the OCR box
+        # length IS the text length, so a tight box that lost much of it falls back to the box.
+        if abs(float(lab_.get('angle') or 0.0)) >= 75 and lab_.get('tight'):
+            tx0, ty0, tx1, ty1 = lab_['tight']
+            bx0, by0, bx1, by1 = lab_['box']
+            if (ty1 - ty0) < 0.8 * (by1 - by0):
+                lab_['tight'] = [bx0, by0, bx1, by1]
+    del _lab_all
+    # The wipe removes linework on purpose. Keeping both sides lets the self-check report the case
+    # where a label box deleted more than its own glyphs - damage no later step can undo.
+    imwrite(os.path.join(work_dir, 'ink_before_wipe.png'), np.where(ink_mask0 > 0, 0, 255).astype(np.uint8))
+    imwrite(os.path.join(work_dir, 'ink_no_text.png'), cleaned_gray)
     for lab_ in labels:
         bx0, by0, bx1, by1 = lab_['box']
         tx0, ty0, tx1, ty1 = lab_['tight']
@@ -518,9 +1354,35 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
     # and re-assign the palette on the healed image -> colour blocks become continuous under text.
     bgr_orig = bgr.copy()
     text_mask = ((ink_mask0 > 0) & (ink_mask == 0)).astype(np.uint8)
+    split_labels = 0
+    foreign = np.zeros(bgr_orig.shape[:2], bool)
+    if MEASURED_TEXT or COLOUR_WIPE:
+        # Two jobs share one pass over the glyph ink, so the switch has to be split inside it:
+        #   measure_only - fills in each label's 'measured' run (length, glyph height, centre) which the
+        #       font sizing needs. ON by default; touches no pixels.
+        #   the returned mask - widens the WIPE to coloured lettering, which the ink wipe never removed
+        #       (so it was re-assigned to a colour layer and traced as ghost lettering inside the patch).
+        #       ON by default: without it a blue label on a blue patch is never cleared at all.
+        _gm, split_labels = glyph_mask_colour_best(bgr_orig, labels, S, measure_only=not COLOUR_WIPE,
+                                                   foreign_out=foreign)
+        text_mask |= _gm
+    # Also tried: subtracting the ink erase_text deliberately kept, on the argument that the
+    # conservative wipe already ruled on those pixels. It gives back 25.5% of the destroyed linework
+    # but stops removing 2.4% of the glyph ink, and that 2.4% is not spread evenly - `structure` and
+    # `depressionbelt` kept a fifth of their lettering and came back as residue. The colour mask is
+    # partly there to cover what erase_text is too cautious to wipe, so it cannot simply defer to it.
+    healed_px = 0
     if text_mask.any():
         text_mask = cv2.dilate(text_mask, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * S + 1, 2 * S + 1)))
         bgr = cv2.inpaint(bgr, text_mask, 3, cv2.INPAINT_TELEA)
+        bgr, healed_px = heal_colour_crossings(bgr_orig, bgr, text_mask, labels,
+                                               glyph_ink=(ink_mask0 > 0) & (ink_mask == 0))
+        # Lines of another colour than the label they pass through (the fault along "fault-fold") are
+        # wiped with the glyphs - leaving them OUT of the pen let the inpaint smear them into the
+        # letter holes as thick red bars - and put back from the original here, after the inpaint.
+        foreign &= text_mask > 0
+        bgr[foreign] = bgr_orig[foreign]
+        healed_px += int(foreign.sum())
         idx = assign_palette(bgr, centers)
 
     ink_dil = cv2.dilate(ink_mask0, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * S + 3, 2 * S + 3)))
@@ -591,15 +1453,130 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
         for bx in (lab_.get('tight', lab_['box']), lab_['box']):     # can lie outside the located one
             x0, y0, x1, y1 = bx
             text_zone[max(y0 - S, 0):y1 + S, max(x0 - S, 0):x1 + S] = 1
+    # cv2.inpaint knows nothing about where a region ends. A label crossing a patch border (the inset's
+    # "Depression" running out of its rectangle, "Chengdu" on the edge of the yellow basin) is filled
+    # from whichever side is nearer, so paper was pushed a dozen pixels into the patch: the rectangle
+    # came out with a bite and a spur. The region shapes judged BEFORE the wipe are right - that first
+    # colour_masks pass already existed and was only used for its union. Inside the wiped area, a
+    # pixel no region claims any more goes back to the region that held it before, but only when it
+    # connects to what is left of that region: a text hole or a bitten edge does, whereas lettering of
+    # a region's own colour standing on paper (the red "nappe structure belt") has nothing left around
+    # it and stays wiped. Colours that live almost entirely inside label boxes are lettering, skipped.
+    # Measured on the geology map: 2,094 px given back, all on bitten edges and text holes.
+    restored_px = 0
+    if text_mask.any():
+        wiped = text_mask > 0
+        taken = np.zeros((h2, w2), bool)
+        for m_ in cmasks.values():
+            taken |= m_ > 0
+        for i_, pre in cmasks_pre.items():
+            pre = pre > 0
+            if i_ not in cmasks or not pre.any():
+                continue
+            if float((pre & (text_zone > 0)).sum()) > 0.5 * float(pre.sum()):
+                continue
+            cur = cmasks[i_] > 0
+            back = pre & wiped & ~taken
+            if not back.any():
+                continue
+            _, lbl_ = cv2.connectedComponents((cur | back).astype(np.uint8), connectivity=8)
+            keep_ = np.unique(lbl_[cur])
+            back &= np.isin(lbl_, keep_[keep_ > 0])
+            if back.any():
+                cmasks[i_] = (cur | back).astype(np.uint8)
+                taken |= back
+                restored_px += int(back.sum())
     for i_ in list(cmasks):
         cmasks[i_] = fill_text_holes(cmasks[i_], text_zone, max_hole=int(0.01 * h2 * w2))
     for j_, (i_, fm_) in enumerate(fills):
         fills[j_] = (i_, fill_text_holes(fm_, text_zone, max_hole=int(0.01 * h2 * w2)))
+    # The anti-aliased edge of a COLOURED line lands in clusters of its own: dark red, orange, pale red
+    # along a red curve. The ink-halo test in color_masks only knows halos of black ink, so each fringe
+    # became a layer of thousands of 2 px specks - on a spectrum plot at S=1 (no super-resolution to
+    # sharpen the edge) three of them, 4-5.5k specks each, and tracing them hung CorelDRAW until the COM
+    # watchdog killed the build. A fringe is mostly dust AND lies along a bigger layer; over 30-odd
+    # colour layers of 10 test drawings only those three fringes pass these tests (dust > 0.5, hug > 0.8),
+    # the next-dustiest real layer is a faint spectrum line at 0.24.
+    fringe_layers = 0
+    for i_ in list(cmasks):
+        m_ = cmasks[i_] > 0
+        tot = int(m_.sum())
+        if not tot:
+            continue
+        _n, _l, st_, _c = cv2.connectedComponentsWithStats(m_.astype(np.uint8), 8)
+        a_ = st_[1:, 4]
+        # ...and its pieces are specks in the literal sense: the fringes average 1.8-2.6 px. A JPEG'd
+        # map's small dark-green patches passed the two tests below just barely (0.54 / 0.81) but
+        # average 32 px, and dropping them lost 10 patches on the tibet_jpeg regression case.
+        if a_.size == 0 or tot / float(a_.size) >= 4 * S * S:
+            continue
+        if float(a_[a_ < 20 * S * S].sum()) <= 0.5 * tot:
+            continue
+        others = ink_mask > 0
+        for j_, o_ in cmasks.items():
+            if j_ != i_ and int((o_ > 0).sum()) > tot:
+                others = others | (o_ > 0)
+        near = cv2.dilate(others.astype(np.uint8), np.ones((4 * S + 1, 4 * S + 1), np.uint8)) > 0
+        if float((m_ & near).sum()) > 0.8 * tot:
+            del cmasks[i_]
+            fringe_layers += 1
+    # Regions run on UNDER the lines drawn across them. A fault through the pink belt left a hole of
+    # its own shape in the pink layer; traced, and rimmed with the patch outline, that hole rendered as
+    # a two-edged tube around the fault. Once the fault is a centerline stroke laid on top, the region
+    # should simply continue beneath it: close each region across the line pixels, a kernel just wider
+    # than a line, so only a gap with the same region on both sides is filled.
+    line_px = np.zeros((h2, w2), np.uint8)
+    line_ids = [i_ for i_ in list(cmasks) if line_strokes(cmasks[i_], [0, 0, 0]) is not None]
+    if line_ids:
+        # The thin anti-aliased line itself is patchy in its own layer: part of its pixels went to no
+        # layer at all (they showed as white gaps in the tube), so its skeleton came out dashed. Grow
+        # each line layer through pixels nobody owns but that lie enclosed by regions - never out
+        # into open paper - before it is skeletonised.
+        owned = np.zeros((h2, w2), np.uint8)
+        for m_ in cmasks.values():
+            owned |= (m_ > 0).astype(np.uint8)
+        for _i, fm_ in fills:
+            owned |= (fm_ > 0).astype(np.uint8)
+        owned |= (ink_mask > 0).astype(np.uint8)
+        regions = owned.copy()
+        for i_ in line_ids:
+            regions &= (cmasks[i_] == 0).astype(np.uint8)
+        enclosed = (cv2.morphologyEx(regions, cv2.MORPH_CLOSE, cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (4 * S + 5, 4 * S + 5))) > 0) & (owned == 0)
+        k3 = np.ones((3, 3), np.uint8)
+        for i_ in line_ids:
+            g_ = (cmasks[i_] > 0).astype(np.uint8)
+            for _ in range(6 * S):
+                n_ = (cv2.dilate(g_, k3) > 0) & enclosed
+                n_ = n_.astype(np.uint8) | g_
+                if int(n_.sum()) == int(g_.sum()):
+                    break
+                g_ = n_
+            if line_strokes(g_, [0, 0, 0]) is None:
+                g_ = (cmasks[i_] > 0).astype(np.uint8)      # growing must never turn it into a patch
+            cmasks[i_] = g_
+            line_px |= g_
+    if line_px.any():
+        line_px = cv2.dilate(line_px, np.ones((3, 3), np.uint8))
+        kc = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4 * S + 5, 4 * S + 5))
+        for i_ in list(cmasks):
+            r_ = (cmasks[i_] > 0).astype(np.uint8)
+            if line_strokes(r_, [0, 0, 0]) is not None:
+                continue
+            cmasks[i_] = r_ | (cv2.morphologyEx(r_, cv2.MORPH_CLOSE, kc) & line_px)
+        for j_, (i_, fm_) in enumerate(fills):
+            r_ = (fm_ > 0).astype(np.uint8)
+            fills[j_] = (i_, r_ | (cv2.morphologyEx(r_, cv2.MORPH_CLOSE, kc) & line_px))
     all_color = np.zeros((h2, w2), bool)
     for m_ in cmasks.values():
         all_color |= m_ > 0
-    ink_mask = drop_specks(drop_patch_outlines(ink_mask, all_color))
+    ink_mask = drop_specks(drop_patch_outlines(
+        ink_mask, all_color, cv2.resize(src_gray, (w2, h2), interpolation=cv2.INTER_NEAREST), text_zone))
     ink_mask, faint_mask, faint_rgb, _ = split_faint_ink(ink_mask, cmasks, centers, src_bgr)
+    # linework other layers already draw - a patch outline must not redraw it (see patch_outline)
+    drawn_px = (ink_mask > 0) | (faint_mask > 0)
+    for i_ in line_ids:
+        drawn_px |= cmasks[i_] > 0
     for i, (c, kind) in enumerate(zip(centers, kinds)):
         if kind == 'grid':
             if grid_done or not grid_mask.any() or rules_meta:
@@ -625,8 +1602,11 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
         f = 'layers/layer_%02d_%s.png' % (i, kind)
         imwrite(os.path.join(work_dir, f), np.where(mask > 0, 0, 255).astype(np.uint8))
         entry = {'file': f, 'kind': kind, 'area': area, 'color': [int(rgb[0]), int(rgb[1]), int(rgb[2])]}
-        if kind == 'color':
-            rim = patch_outline(src_bgr, mask, entry['color'])
+        strokes = line_strokes(mask, entry['color']) if kind == 'color' else None
+        if strokes:
+            entry['strokes'] = strokes
+        elif kind == 'color':
+            rim = patch_outline(src_bgr, mask, entry['color'], drawn=drawn_px)
             if rim:
                 entry['outline'] = {'color': rim, 'width_px': float(S)}      # ~1 source px
         layers.append(entry)
@@ -641,11 +1621,35 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
     # paint order: big colour regions first, smaller ones on top, ink last
     order = {'color': 0, 'grid': 1, 'ink_faint': 2, 'ink': 3}
     layers.sort(key=lambda l: (order.get(l['kind'], 0), -l['area']))
+    for l in labels:
+        ang = abs(float(l.get('angle') or 0.0))
+        # A slanted label with no trustworthy measurement cannot be sized from its box either - that
+        # inversion is singular near 45 degrees and its fallback lets the box decide the font size, which
+        # is the giant-label defect. Leaving it blank is the lesser evil and follows the measured switch.
+        l['unmeasurable'] = bool(MEASURED_TEXT and 4.0 < ang < 75.0 and not l.get('measured'))
+    out_labels = [{'text': l['text'], 'tight': l['tight'], 'box': l['box'], 'color': l['color'],
+                   'glyph_h': l.get('glyph_h', 0), 'text_h': l.get('text_h', 0), 'bold_px': l.get('bold_px', 0.0),
+                   'angle': l.get('angle', 0.0), 'erase_only': bool(l.get('erase_only')),
+                   'unmeasurable': bool(l.get('unmeasurable')), 'measured': l.get('measured'),
+                   'quad': l.get('quad'), 'run_gh': l.get('run_gh'),
+                   # wipe_protected only ever counts the PROTECT_SHAPE branch, which is off by default,
+                   # so it stayed 0 whatever the dash protection did and was read as "protection never
+                   # ran". dash_protect_px is the counter that actually moves, and wipe_colour_px is
+                   # the size of the colour wipe - an inpaint that wipe_spill is structurally unable
+                   # to see, so without it that erase has no observable at all.
+                   'dash_protect_px': int(l.get('dash_protect_px') or 0),
+                   'wipe_colour_px': int(l.get('wipe_colour_px') or 0),
+                   'wipe_protected': int(l.get('wipe_protected') or 0)} for l in labels]
     meta = {'src_size': [w, h], 'scale': S, 'layers': layers, 'rules': rules_meta,
-            'latin_font': detect_latin_font(src_gray, labels),
-            'labels': [{'text': l['text'], 'tight': l['tight'], 'box': l['box'], 'color': l['color'],
-                        'glyph_h': l.get('glyph_h', 0), 'text_h': l.get('text_h', 0), 'bold_px': l.get('bold_px', 0.0),
-                        'angle': l.get('angle', 0.0)} for l in labels]}
+            'latin_font': os.environ.get('CDR_LATIN_FONT') or detect_latin_font(src_gray, labels),
+            'wipe_protected_px': int(sum(int(l.get('wipe_protected') or 0) for l in labels)),
+            'dash_protect_px': int(sum(int(l.get('dash_protect_px') or 0) for l in labels)),
+            'wipe_colour_px': int(sum(int(l.get('wipe_colour_px') or 0) for l in labels)),
+            'colour_healed_px': int(healed_px),
+            'colour_restored_px': int(restored_px),
+            'labels_hue_split': int(split_labels),
+            'fringe_layers_dropped': int(fringe_layers),
+            'labels': annotate_placement(out_labels, S)}
     with open(os.path.join(work_dir, 'layers.json'), 'w', encoding='utf-8') as fh:
         json.dump(meta, fh, ensure_ascii=False, indent=1)
     return meta

@@ -18,7 +18,15 @@ import pythoncom
 # '宋体' is broken through COM in CorelDRAW 2022 here: it becomes 'yyb' at creation and renders
 # tofu when set on the story. These were verified to render CJK correctly.
 FONT_PREF = ['新宋体', '仿宋', '黑体', '微软雅黑']
+TILE_TRACE = os.environ.get('CDR_NO_TILE_TRACE', '').strip() in ('', '0', 'false', 'False')
 TRACE_TYPES = {'lineart': 1, 'logo': 2, 'detailed_logo': 3, 'technical': 7, 'line_drawing': 8}
+
+# Font sizing from the label's own measured text run, computed by cdr_vectorize_color. On by default: it
+# touches only the font size, and the alternative - sizing a rotated label from its axis-aligned box -
+# makes the font follow the box diagonal, which is the giant-label defect. CDR_NO_MEASURED_TEXT=1 turns
+# it off. Read from the environment so this child process need not import the whole vectorize module.
+MEASURED_TEXT = not (os.environ.get('CDR_NO_MEASURED_TEXT', '').strip().lower() in ('1', 'true', 'yes')) \
+    or (os.environ.get('CDR_EXPERIMENTAL', '').strip().lower() in ('1', 'true', 'yes'))
 
 
 
@@ -90,6 +98,47 @@ def label_lang(lab):
     return 2052 if re.search(r'[　-鿿＀-￯]', lab['text']) else 1033
 
 
+def fit_measured_text(sh, lab, k):
+    """Size a SLANTED text object from the run measured along its own line, not from the label box.
+
+    The box is an axis-aligned container around rotated text, and recovering the text length from it is
+    a singular inversion at 45 degrees (the fallback max(W,H) made the font follow the box: giants).
+    The run length L is measured by projecting the glyph ink onto the label's own direction, so the
+    box plays no part.
+
+    Width only. This used to go on and rescale the object so its height matched the measured g - but g
+    is the span holding 80% of the ink across the line, which for lowercase words is about the x-height,
+    while SizeHeight is the whole line with ascenders and descenders. Comparing the two halved every
+    clean label (slope, Tuozitong, Guanghan came out at half size) and, where a crossing line inflated
+    g, blew labels up instead (the giants). It was also applied to horizontal labels, which the tuned
+    fit_horizontal_text handled before: the regression's median size error went from 0.11 to 0.24.
+    Returns False when nothing usable was measured, so the caller keeps the box-derived path.
+    """
+    m = lab.get('measured') or {}
+    try:
+        length = float(m.get('L') or 0.0)
+    except Exception:  # noqa: BLE001
+        return False
+    if length < 4.0:
+        return False
+    try:
+        if sh.SizeWidth <= 0:
+            return False
+        # L is the narrowest span holding 80% of the run's ink (robust to strays), so for evenly spread
+        # lettering it is 0.8 of the run: every slanted label came out at ~80% size. Measured on the
+        # clean labels of the geology map, full run / L = 1.26-1.31.
+        sh.Text.Story.Size = float(sh.Text.Story.Size) * (1.25 * length * k) / float(sh.SizeWidth)
+        # Same tracked-out lettering guard as fit_rotated_text, but generous: g is the measured
+        # x-height and SizeHeight the whole line (ascender to descender), a ratio of ~2.4 for normal
+        # type, so only a gross overshoot is pulled back.
+        cap_h = size_cap(lab, k, 2.0 * float(m.get('g') or 0.0) * k)
+        if cap_h > 0 and float(sh.SizeHeight) > cap_h:
+            sh.Text.Story.Size = float(sh.Text.Story.Size) * cap_h / float(sh.SizeHeight)
+    except Exception:  # noqa: BLE001 - a cosmetic fit must never fail a build
+        return False
+    return True
+
+
 def create_label(layer, lab, cx, cy, font, meta, fonts, k, S):
     """Create the text object for a horizontal label. For Latin-only labels the letter spacing is measured
     rather than assumed: Asian spacing (language 2052) is 17% wider than Latin spacing (1033). Tick numbers
@@ -122,7 +171,8 @@ def create_label(layer, lab, cx, cy, font, meta, fonts, k, S):
 def label_font(lab, font, meta, fonts):
     """CJK font for labels with Chinese characters, the detected proportional Latin font otherwise."""
     import re
-    latin = meta.get('latin_font')
+    # per-label first: a map that prints its region names sans and its place names serif needs both
+    latin = lab.get('latin_font') or meta.get('latin_font')
     if latin and latin in fonts and not re.search(r'[　-鿿＀-￯]', lab['text']):
         return latin
     return font
@@ -157,6 +207,49 @@ def fit_horizontal_text(sh, lab, k, S):
     return 'width'
 
 
+def size_cap(lab, k, g_fallback=0.0):
+    import re
+    """Upper bound for a text object's SizeHeight, in page units.
+
+    Two independent measures of how big the printed lettering is, both taken from the source:
+      * the detector polygon's thickness - the whole printed line, which is what SizeHeight measures;
+      * run_gh, the median blob size across the text line, which a line running along the label cannot
+        move (the span-based g can: Kang-Dian measured 34 for 11 px letters).
+    Tracked-out lettering ("K a n g - D i a n" spread over 200 px) is why a cap is needed at all:
+    sizing by the length of the run then makes every glyph about three times too big.
+    """
+    caps = []
+    qt = quad_thickness(lab, k)
+    if qt:
+        caps.append(1.15 * qt)
+    gh = float(lab.get('run_gh') or 0.0) * k
+    # CJK glyphs split into radicals, so the median blob is a fraction of the character and this cap
+    # would squash them (柴达木盆地 measured 8.8 px for 38 px characters). Latin only.
+    if gh > 0 and not re.search(r'[　-鿿＀-￯]', str(lab.get('text') or '')):
+        caps.append(2.0 * gh)            # SizeHeight ~ 1.15 em, run_gh ~ 0.6 em
+    if not caps and g_fallback > 0:
+        caps.append(1.3 * g_fallback)
+    return min(caps) if caps else 0.0
+
+
+def quad_thickness(lab, k):
+    """Thickness of the detector polygon in page units, or None.
+
+    Map labels are often printed with the letters tracked out ("Kang-Dian" spans 200 px for 9 small
+    letters). Sizing such a label by the LENGTH of its run then makes the glyphs about three times too
+    big. The polygon hugs the lettering across the line, so it bounds the glyph size where the label
+    box - which may also contain the line running beside the text - does not.
+    """
+    import math
+    q = lab.get('quad')
+    if not q or len(q) != 4:
+        return None
+    e = [math.hypot(q[i][0] - q[(i + 1) % 4][0], q[i][1] - q[(i + 1) % 4][1]) for i in range(4)]
+    e.sort()
+    t = 0.5 * (e[0] + e[1]) * k
+    return t if t > 0 else None
+
+
 def fit_rotated_text(sh, lab, k):
     """Size a slanted / vertical label before rotating it. The located box is axis-aligned around the
     rotated text: for |angle| near 90 the text length is the box height; for a moderate slant solve
@@ -175,8 +268,11 @@ def fit_rotated_text(sh, lab, k):
         g = (H * c - W * s_) / den if den > 0.2 else 0.0
     if L > 0 and sh.SizeWidth > 0:
         sh.Text.Story.Size = sh.Text.Story.Size * L / sh.SizeWidth
-    if g > 0 and sh.SizeHeight > 1.3 * g:
-        sh.Text.Story.Size = sh.Text.Story.Size * 1.3 * g / sh.SizeHeight
+    # The polygon wraps the whole printed line, which is what SizeHeight measures, so it caps the
+    # glyph size directly; the box-derived g is a loose stand-in used only when there is no polygon.
+    cap_h = size_cap(lab, k, g)
+    if cap_h > 0 and sh.SizeHeight > cap_h:
+        sh.Text.Story.Size = sh.Text.Story.Size * cap_h / sh.SizeHeight
 
 
 def thicken_text(sh, lab, k, col):
@@ -213,6 +309,43 @@ def draw_marks(app, doc, layer, marks, k, page_h):
         try:
             sr.Group()
         except Exception:  # noqa: BLE001 - grouping is cosmetic
+            pass
+    return n
+
+
+def draw_to_fill_marks(app, doc, page_w, page_h, labels, k):
+    """Magenta outlines marking the labels that were left blank for a human to type.
+
+    Those boxes were wiped from the image but no text object was placed, so the spot is simply empty -
+    and an empty spot in a dense drawing is invisible. The outlines go on their own layer, are drawn
+    AFTER result.png is exported (so the self-check still compares a clean page), and the layer is
+    named so it can be deleted in one click once the typing is done.
+    """
+    todo = [l for l in (labels or []) if l.get('erase_only') or l.get('unmeasurable')]
+    if not todo:
+        return 0
+    try:
+        layer = doc.CreateLayer('TO FILL (delete after typing)')
+    except Exception:  # noqa: BLE001 - older API surface: mark on the active layer instead
+        layer = doc.ActiveLayer
+    magenta = app.CreateColor(); magenta.RGBAssign(255, 0, 255)
+    n = 0
+    for lab in todo:
+        try:
+            x0, y0, x1, y1 = lab['box']
+            w, h = (x1 - x0) * k, (y1 - y0) * k
+            if w <= 0 or h <= 0:
+                continue
+            sh = layer.CreateRectangle2(x0 * k, page_h - y1 * k, w, h)
+            try:
+                sh.Fill.ApplyNoFill()
+            except Exception:  # noqa: BLE001 - a filled rectangle would hide the drawing: drop it
+                sh.Delete()
+                continue
+            sh.Outline.Color.CopyAssign(magenta)
+            sh.Outline.Width = 0.015
+            n += 1
+        except Exception:  # noqa: BLE001 - the marks are a convenience, never a reason to fail a build
             pass
     return n
 
@@ -282,6 +415,137 @@ def draw_rules(app, doc, layer, rules, k, page_h):
     return len(made)
 
 
+def repair_lost_ink(app, doc, layer, work_dir, meta, k, page_h, S, gfx_png):
+    """Redraw linework PowerTRACE dropped, as centerline strokes.
+
+    PowerTRACE judges detail relative to the WHOLE bitmap: a 2 px line is 1.4% of a 140 px crop and
+    survives, but 0.1% of a 2048 px map and is discarded as noise. That is how the orange band's black
+    border (2 x 172 px, drawn in the source) vanished from the geology map - linework no hand edit can
+    restore, because nothing in the file says it was ever there. So the ink layer is checked against
+    what was actually drawn, and every thin run that is missing is put back the way the fault lines are
+    drawn: a centreline stroke. Only long thin pieces qualify, so a dropped speck stays dropped.
+    """
+    try:
+        import cv2
+        import numpy as np
+
+        import cdr_trace_skeleton as sk
+    except Exception:  # noqa: BLE001 - repair is optional, never fail a build over it
+        return 0
+    ink_file = next((l['file'] for l in meta['layers'] if l['kind'] == 'ink'), None)
+    if not ink_file:
+        return 0
+    try:
+        rd = lambda p: cv2.imdecode(np.fromfile(p, np.uint8), cv2.IMREAD_UNCHANGED)
+        ink = rd(os.path.join(work_dir, ink_file.replace('/', os.sep))) < 128
+        gfx = rd(gfx_png)
+        if gfx is None or ink is None:
+            return 0
+        gfx = cv2.cvtColor(gfx[..., :3], cv2.COLOR_BGR2GRAY)
+        gfx = cv2.resize(gfx, (ink.shape[1], ink.shape[0]), interpolation=cv2.INTER_AREA)
+        drawn = cv2.dilate((gfx < 140).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+        missing = (ink & ~drawn).astype(np.uint8)
+        n, cc, st, _ = cv2.connectedComponentsWithStats(missing, 8)
+        polys, widths = [], []
+        for i in range(1, n):
+            x, y, bw, bh, area = st[i]
+            if max(bw, bh) < 20 * S or area < 24 * S:
+                continue
+            comp = (cc[y:y + bh, x:x + bw] == i).astype(np.uint8)
+            skel = sk.skeletonize(comp * 255)
+            ln = int(skel.sum())
+            if ln < 10 * S or area / float(ln) > 4.0 * S:
+                continue                       # not a thin run: leave it to the tracer
+            for path in sk.trace_paths(skel):
+                if len(path) < 6 * S:
+                    continue
+                ap = sk._simplify(path, 0.7 * S).reshape(-1, 2)
+                polys.append([float(v) for xy in ap for v in (xy[0] + x, xy[1] + y)])
+            widths.append(area / float(ln))
+        if not polys:
+            return 0
+        rules = {'polylines': polys, 'width_px': round(max(float(np.median(widths)), 1.0), 2),
+                 'color': [32, 32, 32]}
+        return draw_rules(app, doc, layer, rules, k, page_h)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _trace_mask_tiled(app, doc, layer, png_path, page_w, page_h, trace_type, detail, smoothing,
+                      rgb, k, tile_px=None):
+    """PowerTRACE the mask one TILE at a time, so thin lines are not judged against the whole page.
+
+    The tracer's detail threshold is relative to the bitmap it is given: a 2 px line is 0.1% of a
+    2048 px map and is discarded as noise, but 0.4% of a 500 px tile and survives. Tiles overlap by a
+    few pixels so a line is not cut at a seam; the overlap is the same colour, so it does not show.
+    Returns (group_or_None, (curves, nodes), tiles_used) and falls back to one whole-page trace when
+    the mask is small enough that tiling would buy nothing.
+    """
+    import cv2
+    import numpy as np
+
+    tile_px = tile_px or int(os.environ.get('CDR_TILE_PX', '900') or 900)
+    img = cv2.imdecode(np.fromfile(png_path, np.uint8), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return None, (0, 0), 0
+    H, W = img.shape[:2]
+    cols, rows = max(1, int(round(W / tile_px))), max(1, int(round(H / tile_px)))
+    if cols * rows <= 1:
+        return None, (0, 0), 0
+    ov = 6
+    made, curves, nodes, used = [], 0, 0, 0
+    base = os.path.splitext(png_path)[0]
+    for r in range(rows):
+        for c in range(cols):
+            x0, x1 = max(int(c * W / cols) - ov, 0), min(int((c + 1) * W / cols) + ov, W)
+            y0, y1 = max(int(r * H / rows) - ov, 0), min(int((r + 1) * H / rows) + ov, H)
+            tile = img[y0:y1, x0:x1]
+            if tile.size == 0 or not (tile < 128).any():
+                continue                              # nothing drawn in this tile
+            tp = f'{base}_tile{r}{c}.png'
+            cv2.imencode('.png', tile)[1].tofile(tp)
+            try:
+                layer.Import(tp, 0, app.CreateStructImportOptions())
+                bmp = doc.ActiveShape
+                bmp.SetSize((x1 - x0) * page_w / W, (y1 - y0) * page_h / H)
+                bmp.LeftX = x0 * page_w / W
+                bmp.BottomY = page_h - y1 * page_h / H
+                ts = bmp.Bitmap.Trace(TRACE_TYPES.get(trace_type, 1), smoothing, detail, 8, 0, 2,
+                                      True, True, True)
+                ts.DetailLevelPercent = detail; ts.Smoothing = smoothing; ts.CornerSmoothness = 0
+                ts.MergeAdjacentObjects = True
+                ts.ApplyChanges()
+                curves += int(ts.CurveCount); nodes += int(ts.NodeCount)
+                ts.Finish()
+                grp = doc.ActiveShape
+                if rgb is not None:
+                    col = app.CreateColor(); col.RGBAssign(*[int(v) for v in rgb])
+                    for sh in group_children(grp):
+                        try:
+                            sh.Fill.ApplyUniformFill(col)
+                            sh.Outline.SetNoOutline()
+                        except Exception:  # noqa: BLE001
+                            pass
+                made.append(grp)
+                used += 1
+            except Exception:  # noqa: BLE001 - one bad tile must not lose the layer
+                pass
+            finally:
+                try:
+                    os.remove(tp)
+                except OSError:
+                    pass
+    if not made:
+        return None, (0, 0), 0
+    try:
+        sr = app.CreateShapeRange()
+        for g in made:
+            sr.Add(g)
+        return sr.Group(), (curves, nodes), used
+    except Exception:  # noqa: BLE001 - grouping is cosmetic
+        return made[0], (curves, nodes), used
+
+
 def build_color(app, doc, work_dir, font, trace_type, detail, smoothing, fonts=()):
     """Multi-layer colour build: one PowerTRACE per palette colour, ink layer last, then text."""
     meta = json.load(open(os.path.join(work_dir, 'layers.json'), encoding='utf-8'))
@@ -297,46 +561,93 @@ def build_color(app, doc, work_dir, font, trace_type, detail, smoothing, fonts=(
         if not rules_drawn and lay['kind'] in ('ink', 'ink_faint'):
             done.append({'layer': 'rules', 'kind': 'rules', 'lines': draw_rules(app, doc, layer, meta.get('rules'), k, page_h)})
             rules_drawn = True
+        if lay.get('strokes'):
+            # a layer of thin lines: drawn as centerline strokes like the rules, not outline-traced
+            done.append({'layer': os.path.basename(lay['file']), 'kind': 'strokes', 'color': lay['color'],
+                         'lines': draw_rules(app, doc, layer, lay['strokes'], k, page_h)})
+            continue
         png = os.path.join(work_dir, lay['file'].replace('/', os.sep))
         rgb = lay['color'] if lay['kind'] == 'color' else lay['color']
-        _, (curves, nodes) = _trace_mask(app, doc, layer, png, page_w, page_h,
-                                         trace_type, detail, smoothing, rgb, lay.get('outline'), k)
+        tiles = 0
+        if TILE_TRACE and lay['kind'] in ('ink', 'ink_faint') and not lay.get('outline'):
+            # the linework layer is where the whole-page detail threshold costs real lines
+            _g, (curves, nodes), tiles = _trace_mask_tiled(app, doc, layer, png, page_w, page_h,
+                                                           trace_type, detail, smoothing, rgb, k)
+        if not tiles:
+            _, (curves, nodes) = _trace_mask(app, doc, layer, png, page_w, page_h,
+                                             trace_type, detail, smoothing, rgb, lay.get('outline'), k)
         done.append({'layer': os.path.basename(png), 'kind': lay['kind'], 'color': lay['color'],
-                     'curves': curves, 'nodes': nodes})
+                     'curves': curves, 'nodes': nodes, **({'tiles': tiles} if tiles else {})})
     if not rules_drawn:
         done.append({'layer': 'rules', 'kind': 'rules', 'lines': draw_rules(app, doc, layer, meta.get('rules'), k, page_h)})
+    # CHECKPOINT: graphics-only export before the labels go on (see build() for why)
+    gfx = os.path.join(work_dir, 'graphics_only.png')
+    export_page_png(app, doc, page_w, page_h, gfx, w * 2, h * 2)
+    lost = repair_lost_ink(app, doc, layer, work_dir, meta, k, page_h, S, gfx)
+    if lost:
+        done.append({'layer': 'ink_repair', 'kind': 'strokes', 'color': [32, 32, 32], 'lines': lost})
+        export_page_png(app, doc, page_w, page_h, gfx, w * 2, h * 2)
+    fits = []
     for lab in meta['labels']:
+        if lab.get('erase_only') or lab.get('unmeasurable'):
+            continue          # left blank for a human; marked on the TO FILL layer below
         x0, y0, x1, y1 = lab['tight']
         bw = (x1 - x0) * k
         cx, cy = (x0 + x1) / 2 * k, page_h - (y0 + y1) / 2 * k
+        # the measured run centre anchors the label better than the box centre when the box is off
+        # (slanted labels only, like the sizing below: on a horizontal label the tight box is exact, while
+        # the run centre was pulled onto an adjoining frame line ("39°" landed on the map border) or
+        # lifted by a glyph clipped at the image edge ("75°" printed half off the page))
+        meas = lab.get('measured') or {}
+        # Only for a real slant. At 5-7 degrees the box centre is still the better anchor, while the
+        # measured run centre is pulled sideways by whatever shares the box - the map frame next to
+        # "39°" clipped its first digit off the page.
+        if (meas.get('cx') is not None and meas.get('cy') is not None
+                and 15 <= abs(float(lab.get('angle') or 0.0)) < 75):
+            cx, cy = float(meas['cx']) * k, page_h - float(meas['cy']) * k
         sh = create_label(layer, lab, cx, cy, font, meta, fonts, k, S)
         rgb = lab.get('color') or [0, 0, 0]
         col = app.CreateColor(); col.RGBAssign(int(rgb[0]), int(rgb[1]), int(rgb[2]))
         sh.Fill.ApplyUniformFill(col)
         ang = float(lab.get('angle') or 0.0)
         gh = float(lab.get('glyph_h') or 0) * k          # measured glyph height of the original label
-        if abs(ang) >= 75:
-            fit_rotated_text(sh, lab, k)                 # vertical label (axis title)
-        elif abs(ang) > 4:
-            # slanted label: OCR box width is the diagonal span; fit by height instead
-            if gh > 0:
-                sh.Text.Story.Size = sh.Text.Story.Size * gh / sh.SizeHeight
-        elif lab.get('text_h'):
-            fit_horizontal_text(sh, lab, k, S)
-        else:
-            sh.Text.Story.Size = sh.Text.Story.Size * bw / sh.SizeWidth
-            # CJK glyphs split into radicals, so the median component height underestimates the
-            # glyph size; never cap below ~the confirmed row height
-            if 'box' in lab:
-                gh = max(gh, 0.7 * (lab['box'][3] - lab['box'][1]) * k)
-            if gh > 0 and sh.SizeHeight > 1.25 * gh:
-                sh.Text.Story.Size = sh.Text.Story.Size * 1.25 * gh / sh.SizeHeight   # width fit over-shot
+        # measured runs size slanted labels only; horizontal ones keep the tuned box/text_h fit
+        if not (MEASURED_TEXT and 4 < abs(ang) < 75 and fit_measured_text(sh, lab, k)):
+            # Fallback: the box-derived fits below, used when the label has no measured run to size from
+            # (see MEASURED_TEXT above) or when the measurement is missing/unusable.
+            if abs(ang) >= 75:
+                fit_rotated_text(sh, lab, k)             # vertical label (axis title)
+            elif abs(ang) > 4:
+                # slanted label: OCR box width is the diagonal span; fit by height instead
+                if gh > 0:
+                    sh.Text.Story.Size = sh.Text.Story.Size * gh / sh.SizeHeight
+            elif lab.get('text_h'):
+                fit_horizontal_text(sh, lab, k, S)
+            else:
+                sh.Text.Story.Size = sh.Text.Story.Size * bw / sh.SizeWidth
+                # CJK glyphs split into radicals, so the median component height underestimates the
+                # glyph size; never cap below ~the confirmed row height
+                if 'box' in lab:
+                    gh = max(gh, 0.7 * (lab['box'][3] - lab['box'][1]) * k)
+                if gh > 0 and sh.SizeHeight > 1.25 * gh:
+                    sh.Text.Story.Size = sh.Text.Story.Size * 1.25 * gh / sh.SizeHeight   # width fit over-shot
+        try:
+            # observability: the size each label ended up at, and the cap that was available. Sizing
+            # bugs are invisible once the object is rotated (SizeHeight then reads the rotated box).
+            fits.append({'text': lab.get('text', '')[:24], 'pt': round(float(sh.Text.Story.Size), 1),
+                         'line_px': round(float(sh.SizeHeight) / k, 1),
+                         'cap_px': round(size_cap(lab, k) / k, 1) if size_cap(lab, k) else None})
+        except Exception:  # noqa: BLE001
+            pass
         thicken_text(sh, lab, k, col)
         sh.CenterX = cx; sh.CenterY = cy
         if abs(ang) > 4:
             sh.Rotate(-ang)                              # image-space slant -> page-space (y up) rotation
             sh.CenterX = cx; sh.CenterY = cy
-    return {'layers_built': done, 'labels': len(meta['labels']), 'page_in': [page_w, page_h]}
+    # only the labels the cap actually held back are worth reporting; the full list is noise
+    capped = [f for f in fits if f.get('cap_px') and f['line_px'] >= 0.98 * f['cap_px']][:20]
+    return {'layers_built': done, 'labels': len(meta['labels']), 'page_in': [page_w, page_h],
+            'text_size_capped': capped}
 
 
 def build(work_dir, font=None, trace_type='lineart', detail=100, smoothing=25, mode='lineart'):
@@ -349,16 +660,57 @@ def build(work_dir, font=None, trace_type='lineart', detail=100, smoothing=25, m
     k = page_w / (w * S)                         # working px -> inch
     import win32com.client
     app = win32com.client.Dispatch('CorelDRAW.Application')
-    fonts = {str(f) for f in app.FontList}
-    if not font or font not in fonts or font == '宋体':
-        font = next(f for f in FONT_PREF if f in fonts)
+    # A just-started CorelDRAW answers Documents.Count but not yet FontList ("does not support
+    # enumeration"), and that crashed the build seconds after an automatic restart. The list is only
+    # used to check a font exists, so it is worth waiting briefly for - and doing without if it never
+    # arrives, in which case the requested font is taken at face value.
+    fonts = set()
+    for _try in range(10):
+        try:
+            fonts = {str(f) for f in app.FontList}
+            if fonts:
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)
+    if fonts and (not font or font not in fonts or font == '宋体'):
+        font = next((f for f in FONT_PREF if f in fonts), font or FONT_PREF[0])
+    elif not font:
+        font = FONT_PREF[0]
     cdr_path = os.path.join(work_dir, 'result.cdr'); png_path = os.path.join(work_dir, 'result.png')
+    # A build that was killed mid-COM (the step's own timeout does exactly that) never reached the
+    # close below, so its half-built document is still open here. Left alone they pile up and every
+    # later build in the same instance gets slower. Close whatever is open before starting a new one.
+    try:
+        for _ in range(int(app.Documents.Count)):
+            d = app.ActiveDocument
+            d.Dirty = False
+            d.Close()
+    except Exception:  # noqa: BLE001 - nothing open, or an instance that will be restarted anyway
+        pass
     doc = None; t0 = time.time(); info = {}
     try:
-        doc = app.CreateDocumentEx(app.CreateStructCreateOptions())
+        doc = None
+        for _try in range(10):
+            # A restarted CorelDRAW exposes Documents and the font list before it exposes the
+            # document API: the call below then fails with "Application.CreateDocumentEx". Wait for
+            # it rather than losing the build to a cold start.
+            try:
+                doc = app.CreateDocumentEx(app.CreateStructCreateOptions())
+                break
+            except Exception:  # noqa: BLE001
+                try:
+                    doc = app.CreateDocument()
+                    break
+                except Exception:  # noqa: BLE001
+                    time.sleep(3)
+        if doc is None:
+            raise RuntimeError('CorelDRAW did not expose its document API (cold start?)')
         if mode == 'color':
             info.update(build_color(app, doc, work_dir, font, trace_type, detail, smoothing, fonts))
             export_page_png(app, doc, page_w, page_h, png_path, w * 2, h * 2)
+            # drawn after the export so result.png - and the self-check that reads it - stays clean
+            info['to_fill_marks'] = draw_to_fill_marks(app, doc, page_w, page_h, meta['labels'], k)
             doc.SaveAs(cdr_path, app.CreateStructSaveAsOptions())
             info.update(ok=True, cdr=cdr_path, png=png_path, font=font, mode='color',
                         total_seconds=round(time.time() - t0, 1))
@@ -377,9 +729,16 @@ def build(work_dir, font=None, trace_type='lineart', detail=100, smoothing=25, m
         ts.ApplyChanges()
         info.update(curves=int(ts.CurveCount), nodes=int(ts.NodeCount), trace_seconds=round(time.time() - t0, 1))
         ts.Finish()
+        # CHECKPOINT: export right after the trace, BEFORE the fine marks are drawn and before any
+        # text, so it matches sr2_no_text.png one to one - the exact image PowerTRACE was handed,
+        # which holds neither text nor fine marks (extract_fine_marks took those out). Comparing
+        # after draw_marks would report the deliberately redrawn dots as "extra graphics".
+        export_page_png(app, doc, page_w, page_h, os.path.join(work_dir, 'graphics_only.png'), w * 2, h * 2)
         info['fine_marks'] = draw_marks(app, doc, layer, meta.get('marks'), k, page_h)
         black = app.CreateColor(); black.RGBAssign(0, 0, 0)
         for lab in meta['labels']:
+            if lab.get('erase_only'):
+                continue      # left blank for a human; marked on the TO FILL layer below
             x0, y0, x1, y1 = lab['tight']
             bw = (x1 - x0) * k
             cx, cy = (x0 + x1) / 2 * k, page_h - (y0 + y1) / 2 * k
@@ -394,6 +753,8 @@ def build(work_dir, font=None, trace_type='lineart', detail=100, smoothing=25, m
                 thicken_text(s, lab, k, black)
             s.CenterX = cx; s.CenterY = cy
         export_page_png(app, doc, page_w, page_h, png_path, w * 2, h * 2)
+        # drawn after the export so result.png - and the self-check that reads it - stays clean
+        info['to_fill_marks'] = draw_to_fill_marks(app, doc, page_w, page_h, meta['labels'], k)
         doc.SaveAs(cdr_path, app.CreateStructSaveAsOptions())
         info.update(ok=True, cdr=cdr_path, png=png_path, font=font, labels=len(meta['labels']),
                     total_seconds=round(time.time() - t0, 1))
@@ -415,11 +776,30 @@ def time_budget(work_dir, mode):
         meta = json.load(open(os.path.join(work_dir, name), encoding='utf-8'))
     except Exception:  # noqa: BLE001
         return 240
+    layers = meta.get('layers') or [None]
+    # every polyline drawn through COM costs about the same, whether it is a graticule rule or a
+    # colour layer drawn as centreline strokes - and the stroke layers were missing from this sum,
+    # which is how a grid map with 452 strokes in one layer (25 s of real work) ran out of budget
     rules = len((meta.get('rules') or {}).get('polylines', []))
+    for lay in layers:
+        st = (lay or {}).get('strokes') or {}
+        rules += len(st.get('polylines', []) if isinstance(st, dict) else st)
     marks = meta.get('marks') or {}
     n_marks = len(marks.get('dots', [])) + len(marks.get('strokes', []))
-    budget = (120 + 30 * len(meta.get('layers', [None])) + 0.5 * len(meta.get('labels', []))
-              + 0.05 * rules + 0.02 * n_marks)
+    # a tiled ink layer is one import+trace per tile instead of one for the page
+    tiles = 0
+    if TILE_TRACE:
+        try:
+            tw, th = meta['src_size']; S = meta.get('scale') or 1
+            tp = int(os.environ.get('CDR_TILE_PX', '900') or 900)
+            n = max(1, int(round(tw * S / tp))) * max(1, int(round(th * S / tp)))
+            tiles = (n if n > 1 else 0) * sum(
+                1 for lay in layers if (lay or {}).get('kind') in ('ink', 'ink_faint')
+                and not (lay or {}).get('outline') and not (lay or {}).get('strokes'))
+        except Exception:  # noqa: BLE001
+            tiles = 0
+    budget = (120 + 30 * len(layers) + 0.5 * len(meta.get('labels', []))
+              + 0.1 * rules + 0.02 * n_marks + 4 * tiles)
     return int(min(max(budget, 240), 900))
 
 

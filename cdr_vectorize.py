@@ -24,11 +24,58 @@ import cv2
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-# Real-ESRGAN (ncnn-vulkan build) lives in tools/realesrgan/ next to this file; override with CDR_TOOLS.
 TOOLS = os.environ.get('CDR_TOOLS', os.path.join(HERE, 'tools'))
 REALESRGAN = os.path.join(TOOLS, 'realesrgan', 'realesrgan-ncnn-vulkan.exe')
 MODELS = os.path.join(TOOLS, 'realesrgan', 'models')
-S = 2  # working scale relative to the source image
+S = max(1, int(os.environ.get('CDR_SR', '2')))  # working scale relative to the source image.
+# Set CDR_SR=1 for images that are ALREADY crisp and large: upscaling them x2 pushes the working size
+# past MAX_WORK_MPX, which then shrinks the source back down, so the super-resolution is paid for and
+# immediately undone - at the cost of ~60% of the source pixels (and half the glyph height).
+
+def _flag(name: str) -> bool:
+    """An on/off switch read from the environment."""
+    return os.environ.get(name, '').strip().lower() in ('1', 'true', 'yes')
+
+
+# Optional experiments, kept behind switches rather than deleted. CDR_EXPERIMENTAL=1 turns them all on.
+#
+# The two are different in kind, so they are separate switches:
+#
+#   MEASURED_TEXT - sizes a label from the text run projected along the label's OWN angle, instead of
+#       from the axis-aligned box. It touches ONLY the font size, never the wipe. The default path
+#       measures a rotated label's "glyph height" across its axis-aligned box, which for slanted text is
+#       the box diagonal and comes out far too large - that is the giant-label defect. So this one is ON
+#       by default (CDR_NO_MEASURED_TEXT=1 disables it). It tends to undershoot rather than overshoot.
+#
+#   QUAD_WIPE - bounds the wipe to the DBNet polygon instead of the box. The box measures 1.67x the
+#       polygon's area and 40% of it is not text, so the box drags dashes and patch edges into the wipe;
+#       but bounding it cut the wipe area by 58% and text stopped being cleared. OFF by default: clearing
+#       text is the job, and a text object is easier to fix by hand than missing linework.
+#
+#   COLOUR_WIPE - widens the wipe to lettering whose colour is not "ink" (blue/red labels on a coloured
+#       patch). Without it those labels are never wiped at all: the palette classifies them as a colour,
+#       so the ink wipe never sees them, and they come back traced as ghost lettering inside the patch.
+#       ON by default - it is the only thing that clears coloured labels. CDR_NO_COLOUR_WIPE=1 disables.
+#
+_EXPERIMENTAL = _flag('CDR_EXPERIMENTAL')
+MEASURED_TEXT = (not _flag('CDR_NO_MEASURED_TEXT')) or _EXPERIMENTAL
+QUAD_WIPE = _EXPERIMENTAL or _flag('CDR_QUAD_WIPE')
+PROTECT_SHAPE = _EXPERIMENTAL or _flag('CDR_PROTECT_SHAPE')
+COLOUR_WIPE = (not _flag('CDR_NO_COLOUR_WIPE')) or _EXPERIMENTAL
+# Re-read regions the first OCR pass was unsure about, at a real magnification (see
+# reocr_dense_regions). ON by default: it only ADDS candidates, never overwrites an existing reading.
+REOCR = (not _flag('CDR_NO_REOCR')) or _EXPERIMENTAL
+# Back-compat alias for the old single switch.
+EXPERIMENTAL = _EXPERIMENTAL
+
+# Dashed-rule protection. A dashed rule is a run of short segments, and a short segment is shaped
+# exactly like a character stroke at this scale, so the wipe eats the dashes that cross a label box.
+# The detector in dash_protect finds those dashes first and their pixels are then excluded from the
+# wipe. ON by default (a text object is easy to fix by hand, missing linework is not);
+# CDR_NO_DASH_PROTECT=1 disables it. DASH_CRUMB_GUARD additionally stops the trailing crumb clean-up
+# from deleting a dash segment the detector just rescued.
+DASH_PROTECT = (not _flag('CDR_NO_DASH_PROTECT')) or _EXPERIMENTAL
+DASH_CRUMB_GUARD = True
 
 
 def imread(p, flag=cv2.IMREAD_GRAYSCALE):
@@ -76,6 +123,12 @@ def super_resolve(src_png, out_dir, span=None, gamma=None):
     Colour is carried through; sr2.png (grey) and sr2_color.png (BGR) are both written."""
     src_c = imread(src_png, cv2.IMREAD_COLOR)
     h, w = src_c.shape[:2]
+    if S <= 1:
+        # No super-resolution: work at the source resolution. Reached for images that are already crisp
+        # and large, where upscaling would only be shrunk back by MAX_WORK_MPX afterwards.
+        imwrite(os.path.join(out_dir, 'sr2_color.png'), src_c)
+        imwrite(os.path.join(out_dir, 'sr2.png'), cv2.cvtColor(src_c, cv2.COLOR_BGR2GRAY))
+        return w, h
     size = (w * S, h * S)
     plain = _sr2(src_png, os.path.join(out_dir, 'sr4.png'), size, color=True)
     hsv = cv2.cvtColor(src_c, cv2.COLOR_BGR2HSV)
@@ -179,7 +232,12 @@ def ocr_candidates(src_bgr):
                 if abs(ang) < 4 or abs(ang) > 60:   # near-horizontal stays 0; absurd slants are noise
                     ang = 0.0
                 dets.append({'text': t.strip(), 'score': float(sc), 'angle': round(ang, 1),
-                             'box': [min(xs), min(ys), max(xs), max(ys)]})
+                             'box': [min(xs), min(ys), max(xs), max(ys)],
+                             # Keep the detector's own polygon. The axis-aligned box above measures 1.67x
+                             # its area on a rotated label, and the extra 40% is linework, dashes and
+                             # patch edges - all of which then sit inside the wipe and get destroyed.
+                             # /f, exactly like the box above: the detector ran on an upscaled copy
+                             'quad': [[round(float(p[0]) / f, 1), round(float(p[1]) / f, 1)] for p in quad]})
     # vertical labels (chart axis titles): read the page rotated both ways and map boxes back.
     # Clockwise-rotated reads are bottom-to-top text (image angle -90), counter-clockwise top-to-bottom (+90).
     h0, w0 = gray.shape
@@ -197,7 +255,8 @@ def ocr_candidates(src_bgr):
                 if (max(ys) - min(ys)) < 1.5 * (max(xs) - min(xs)) or len(t.strip()) < 2:
                     continue                                   # only genuinely vertical text lines
                 dets.append({'text': t.strip(), 'score': float(sc), 'angle': ang,
-                             'box': [min(xs), min(ys), max(xs), max(ys)]})
+                             'box': [min(xs), min(ys), max(xs), max(ys)],
+                             'quad': [[round(float(p_[0]), 1), round(float(p_[1]), 1)] for p_ in pts]})
 
     def iou(a, b):
         ix = max(0, min(a[2], b[2]) - max(a[0], b[0])); iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
@@ -211,10 +270,12 @@ def ocr_candidates(src_bgr):
                 c['box'] = [min(c['box'][0], dt['box'][0]), min(c['box'][1], dt['box'][1]),
                             max(c['box'][2], dt['box'][2]), max(c['box'][3], dt['box'][3])]
                 c['readings'].append([dt['text'], round(dt['score'], 2)])
+                c['quads'].append((dt['score'], dt.get('quad')))
                 c['angles'].setdefault(_norm_reading(dt['text']), dt['angle'])
                 break
         else:
             clusters.append({'box': list(dt['box']), 'angle': dt['angle'],
+                             'quads': [(dt['score'], dt.get('quad'))],
                              'angles': {_norm_reading(dt['text']): dt['angle']},
                              'readings': [[dt['text'], round(dt['score'], 2)]]})
     out = []
@@ -231,6 +292,8 @@ def ocr_candidates(src_bgr):
         n_win = sum(1 for t, _ in c['readings'] if _norm_reading(t) == win)
         cand = {'text': best_form[win], 'box': [int(v) for v in c['box']],
                 'angle': c['angles'].get(win, c.get('angle', 0.0)),
+                # the polygon of the strongest reading: this is what the wipe should be bounded by
+                'quad': (max(c['quads'], key=lambda q: q[0])[1] if c.get('quads') else None),
                 'readings': c['readings'], 'score': round(best_score[win], 2), 'votes': n_win,
                 'agreement': round(votes[win] / sum(votes.values()), 2)}
         degree = _fix_degree(gray, cand)
@@ -254,6 +317,169 @@ def ocr_candidates(src_bgr):
             cand['why'] = '; '.join(reasons)
         out.append(cand)
     return sorted(out, key=lambda c: (c['box'][1], c['box'][0]))
+
+
+def reocr_dense_regions(src_bgr, cands, min_h=34, target=900, max_regions=24):
+    """Re-read the regions where the first pass loses characters, at a REAL magnification.
+
+    The detector resizes whatever it is handed to a fixed side length, so upscaling the WHOLE image buys
+    nothing - the gain is undone inside the detector. Cropping a region first keeps the crop inside that
+    limit, so the same glyphs really do arrive with more pixels each. Rows of small, tightly packed
+    labels are exactly where the first pass drops or mis-reads characters, and more pixels per glyph -
+    not a better threshold - is what fixes that.
+
+    Returns EXTRA candidates only. Nothing already read is overwritten: letting a second opinion replace
+    the first is how a confidently wrong reading gets in unopposed.
+    """
+    from rapidocr_onnxruntime import RapidOCR
+
+    gray = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2GRAY) if src_bgr.ndim == 3 else src_bgr
+    h, w = gray.shape[:2]
+
+    # ---- where to look: detections the first pass was unsure about, or that are small
+    mask = np.zeros((h, w), np.uint8)
+    marks = 0
+    for c in cands:
+        b = c.get('box')
+        if not b:
+            continue
+        if float(c.get('score', 1.0)) < UNCERTAIN_MAX_SCORE or (b[3] - b[1]) < min_h:
+            mask[max(int(b[1]), 0):int(b[3]), max(int(b[0]), 0):int(b[2])] = 1
+            marks += 1
+    if marks == 0:
+        return []
+
+    # ---- one crop per cluster of marks, so a whole row of small labels is read in one go
+    cl = cv2.dilate(mask, np.ones((max(24, int(min_h * 1.2)),) * 2, np.uint8))
+    n, _lab, st, _c = cv2.connectedComponentsWithStats(cl, 8)
+    regions = [tuple(int(v) for v in st[i][:4]) + (int(st[i][4]),) for i in range(1, n)]
+    regions = [r for r in regions if (r[2] - r[0]) * (r[3] - r[1]) >= 400]
+    regions.sort(key=lambda r: -r[4])
+    regions = regions[:max_regions]
+
+    def _iou(a, b):
+        ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+        iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+        inter = ix * iy
+        return inter / ((a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter + 1e-9)
+
+    eng = RapidOCR(text_score=0.2)
+    extra = []
+    for (x0, y0, x1, y1, _a) in regions:
+        pad = int(0.3 * max(x1 - x0, y1 - y0))
+        cx0, cy0 = max(x0 - pad, 0), max(y0 - pad, 0)
+        cx1, cy1 = min(x1 + pad, w), min(y1 + pad, h)
+        crop = gray[cy0:cy1, cx0:cx1]
+        if crop.size == 0 or min(crop.shape) < 8:
+            continue
+        # magnify until the crop's LONG side reaches the detector's own limit, and no further
+        f = min(6.0, max(1.0, target / float(max(crop.shape))))
+        up = cv2.resize(crop, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC)
+        res, _e = eng(cv2.cvtColor(up, cv2.COLOR_GRAY2BGR), use_cls=False,
+                      text_score=0.2, box_thresh=0.3)
+        for quad, t, sc in res or []:
+            t = str(t).strip()
+            if len(t) < 2:
+                continue
+            xs = [p[0] / f + cx0 for p in quad]
+            ys = [p[1] / f + cy0 for p in quad]
+            box = [int(min(xs)), int(min(ys)), int(max(xs)), int(max(ys))]
+            if any(_iou(c['box'], box) > 0.3 for c in cands if c.get('box')):
+                continue                       # already known - never overwrite a first reading
+            if any(_iou(e['box'], box) > 0.3 for e in extra):
+                continue
+            top = (quad[1][0] - quad[0][0], quad[1][1] - quad[0][1])
+            ang = math.degrees(math.atan2(top[1], top[0]))
+            if abs(ang) < 4 or abs(ang) > 60:
+                ang = 0.0
+            extra.append({'text': t, 'box': box, 'angle': round(ang, 1),
+                          'readings': [[t, round(float(sc), 2)]], 'score': round(float(sc), 2),
+                          'votes': 1, 'agreement': 1.0, 'from_reocr': True, 'quad': None})
+    return extra
+
+
+def reread_slanted(src_bgr, cands, target=1000, min_len=3):
+    """Re-read every slanted label from a crop that has been rotated FLAT and magnified.
+
+    The detector rescales whatever it is handed to a fixed side length, so a small label only ever
+    gains pixels from a crop - and a slanted one is also read across its own baseline, which is how
+    "Depression" came back as "epression", "Eastern" as "stern" and "high-steep" as "high-": the word
+    is split and the leading fragment is dropped. Rotating the crop flat puts the whole word on one
+    horizontal line.
+
+    Conservative on purpose (a confidently wrong second opinion is worse than none):
+      * the text is REPLACED only when the new reading CONTAINS the old one and is longer - the
+        fragment-completed case, where there is nothing to disagree about;
+      * any other disagreement is recorded as an extra reading and marks the label uncertain, so the
+        review sheet asks a human instead of silently choosing.
+    """
+    from rapidocr_onnxruntime import RapidOCR
+
+    gray = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2GRAY) if src_bgr.ndim == 3 else src_bgr
+    H, W = gray.shape[:2]
+    eng = RapidOCR(text_score=0.2)
+    fixed = flagged = 0
+    for c in cands:
+        ang = float(c.get('angle') or 0.0)
+        text = str(c.get('text') or '').strip()
+        box = c.get('box')
+        if abs(ang) <= 4 or abs(ang) >= 75 or len(text) < min_len or not box:
+            continue
+        # The strip is cut from the detector's own polygon, not from the axis-aligned box: a slanted
+        # box is mostly other map, and padding it swallowed the neighbouring label ("mountains" came
+        # back as "nongmenmountains", "Xinchang" as "Xiaoquan"). Padding is a fraction of the strip's
+        # THICKNESS, so the word keeps its ends and gains no neighbours.
+        q = c.get('quad')
+        if q and len(q) == 4:
+            rect = cv2.minAreaRect(np.array([[float(p[0]), float(p[1])] for p in q], np.float32))
+            (rcx, rcy), (rw, rh), rang = rect
+        else:
+            x0, y0, x1, y1 = (float(v) for v in box)
+            rcx, rcy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+            rw = math.hypot(x1 - x0, y1 - y0) * 0.75
+            rh = min(x1 - x0, y1 - y0) * 0.8
+            rang = ang
+        if rw < rh:                                  # keep the long side along the text
+            rw, rh, rang = rh, rw, rang + 90.0
+        if rh < 6 or rw < 10:
+            continue
+        pad_t = 0.45 * rh
+        out_w, out_h = int(rw + 1.2 * rh), int(rh + 2 * pad_t)
+        if out_w < 12 or out_h < 12:
+            continue
+        M = cv2.getRotationMatrix2D((rcx, rcy), rang, 1.0)
+        M[0, 2] += out_w / 2.0 - rcx
+        M[1, 2] += out_h / 2.0 - rcy
+        flat = cv2.warpAffine(gray, M, (out_w, out_h), flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_REPLICATE)
+        f = min(8.0, max(1.0, target / float(max(flat.shape))))
+        up = cv2.resize(flat, None, fx=f, fy=f, interpolation=cv2.INTER_CUBIC) if f > 1.01 else flat
+        try:
+            res, _ = eng(cv2.cvtColor(up, cv2.COLOR_GRAY2BGR), use_cls=False,
+                         text_score=0.2, box_thresh=0.3)
+        except Exception:  # noqa: BLE001 - a second opinion must never break prepare
+            continue
+        best = max(res or [], key=lambda r: float(r[2]) * len(str(r[1]).strip()), default=None)
+        if not best:
+            continue
+        new = str(best[1]).strip()
+        sc = float(best[2])
+        if not new or new == text:
+            continue
+        c.setdefault('readings', []).append([new, round(sc, 2), 'deskew-crop'])
+        # Accept only a PREFIX completion. What the detector loses on a slanted run is the start of
+        # the word ("Depression" -> "epression", "Eastern" -> "stern"); characters appearing at the
+        # END are the neighbouring label bleeding into the strip ("Xinchang" -> "Xinchangia").
+        if (new.lower().endswith(text.lower()) and len(new) > len(text)
+                and len(new) - len(text) <= max(3, len(text) // 2)):
+            c['text'] = new                      # a fragment completed: nothing to disagree about
+            c['from_deskew'] = True
+            fixed += 1
+        elif sc >= 0.8:
+            c['uncertain'] = True                # two confident readings that differ: ask a human
+            c['why'] = '; '.join(x for x in (c.get('why'), f'deskewed crop reads "{new}"') if x)
+            flagged += 1
+    return fixed, flagged
 
 
 _ROMAN = re.compile(r'^[IVXLTAl1|\-·.]+$')
@@ -527,7 +753,21 @@ def prepare(image_path, out_dir):
     imwrite(src_png, img)
     w, h = super_resolve(src_png, out_dir)
     src_bgr = imread(src_png, cv2.IMREAD_COLOR)
-    cands = select_labels(ocr_candidates(src_bgr))
+    raw = ocr_candidates(src_bgr)
+    reocr_added = 0
+    if REOCR:
+        _extra = reocr_dense_regions(src_bgr, raw)
+        if _extra:
+            raw = raw + _extra
+            reocr_added = len(_extra)
+    deskew_fixed = deskew_flagged = 0
+    if REOCR:
+        # slanted labels once more, from a crop rotated flat (see reread_slanted)
+        try:
+            deskew_fixed, deskew_flagged = reread_slanted(src_bgr, raw)
+        except Exception:  # noqa: BLE001 - a second opinion must never break prepare
+            pass
+    cands = select_labels(raw)
     src_gray = cv2.cvtColor(src_bgr, cv2.COLOR_BGR2GRAY)
     for c in cands:
         if c.get('use'):
@@ -538,6 +778,8 @@ def prepare(image_path, out_dir):
     missing = find_unlabeled_text(src_bgr, cands)
     sheet = review_sheet(src_bgr, cands, missing, os.path.join(out_dir, 'label_review.png'))
     meta = {'source': image_path, 'src_size': [w, h], 'scale': S, 'candidates': cands,
+            'reocr_added': reocr_added,
+            'deskew_fixed': deskew_fixed, 'deskew_flagged': deskew_flagged,
             'unlabeled_text': missing, 'review_sheet': sheet, 'mode': detect_mode(src_bgr),
             'source_scale': round(source_scale, 4), 'input_size': [iw, ih],
             'paper_rgb': paper_bgr[::-1] if paper_bgr else None}
@@ -578,6 +820,41 @@ def _glyph_components(ink_nh, box, glyph_h):
         x, y, w, h, a = st[i]
         gy0, gy1 = y + Y0, y + Y0 + h
         if h <= 1.3 * glyph_h and w <= 1.6 * glyph_h and gy0 >= y0 - 0.35 * glyph_h and gy1 <= y1 + 0.35 * glyph_h:
+            mask[Y0:Y1, X0:X1][lab == i] = 1
+    return mask
+
+
+def _shape_protect_mask(ink_nh, box, glyph_h):
+    """Ink inside a label box that must NOT be wiped: components whose shape rules them out as
+    characters at this text size, or which run well past the box the way a line does.
+
+    erase_text() blanks the label boxes BEFORE PowerTRACE runs, so whatever is wiped here is missing
+    from the delivered drawing and no later step can put it back. A box that happens to clip a fault
+    trace, a run of hatching or a small symbol therefore costs real linework, which is why the wipe is
+    bounded to what actually looks like a glyph.
+    """
+    x0, y0, x1, y1 = box
+    pad = int(2 * glyph_h)
+    X0, Y0 = max(x0 - pad, 0), max(y0 - pad, 0)
+    X1, Y1 = min(x1 + pad, ink_nh.shape[1]), min(y1 + pad, ink_nh.shape[0])
+    if X1 <= X0 or Y1 <= Y0:
+        return np.zeros_like(ink_nh)
+    sub = ink_nh[Y0:Y1, X0:X1]
+    n, lab, st, _ = cv2.connectedComponentsWithStats(sub, 8)
+    mask = np.zeros_like(ink_nh)
+    slack = int(0.5 * glyph_h)
+    for i in range(1, n):
+        x, y, w, h, _ = st[i]
+        # Keep the judgement conservative on purpose. Widening the wipe (by relaxing this) also widens
+        # the ink box erase_text derives the TEXT PLACEMENT box from, and for rotated labels that box is
+        # already generous - the text objects then come out grossly oversized. Protecting this much
+        # costs a leftover ghost of some rotated words, which is the cheaper of the two failures.
+        too_big = h > 1.6 * glyph_h or w > 2.2 * glyph_h
+        # a component that merely grazes the box edge is a glyph whose box was drawn a little tight;
+        # one that runs well past it is part of a line drawn across the label
+        escapes = (X0 + x < x0 - slack or Y0 + y < y0 - slack
+                   or X0 + x + w > x1 + slack or Y0 + y + h > y1 + slack)
+        if too_big or escapes:
             mask[Y0:Y1, X0:X1][lab == i] = 1
     return mask
 
@@ -676,6 +953,42 @@ def _split_box(ink_nh, box, parts):
     return boxes
 
 
+def _measured_band(lab, shape):
+    """The text strip of a slanted label from its MEASURED run (centre, length, glyph height).
+
+    Independent of the axis-aligned box, so it holds at any angle - including the 45 degrees where
+    inverting the box is singular - and it is where the lettering actually is rather than where a
+    loose OCR box says it might be.
+    """
+    m = lab.get('measured') or {}
+    ang = float(lab.get('angle') or 0.0)
+    if not m or abs(ang) <= 4:
+        return None
+    try:
+        ln, g = float(m['L']), float(m['g'])
+        cx, cy = float(m['cx']), float(m['cy'])
+    except Exception:  # noqa: BLE001 - measurement is optional
+        return None
+    if ln <= 0 or g <= 0:
+        return None
+    # A line running along the lettering inflates g (Kang-Dian: 34 px for 20 px letters), and the
+    # strip then covers the whole box again. The detector polygon is a poor bound overall - it is why
+    # QUAD_WIPE is off - but its THICKNESS is a sane cap for one that is measured too fat.
+    t = 2.2 * g
+    q = lab.get('quad')
+    if q and len(q) == 4:
+        e = [math.hypot(q[i][0] - q[(i + 1) % 4][0], q[i][1] - q[(i + 1) % 4][1]) for i in range(4)]
+        qt = float(np.mean(sorted(e)[:2]))
+        if qt > 2:
+            t = min(t, 1.3 * qt)
+    # L is the span holding 80% of the run, so the ends need the same 1.25 the font sizing uses,
+    # plus a glyph height of slack at each end for the letters the measurement trimmed.
+    rect = (cx, cy), (1.25 * ln + 2.0 * g + 2 * S, t + 2 * S), ang
+    m_ = np.zeros(shape, np.uint8)
+    cv2.fillPoly(m_, [cv2.boxPoints(rect).astype(np.int32)], 1)
+    return m_
+
+
 def _slant_band(lab, box, shape):
     """Mask of the rotated text strip inside an axis-aligned box of a slanted label (|angle| > 4).
     For a box W x H holding a strip of length l and thickness t at angle a:
@@ -687,14 +1000,23 @@ def _slant_band(lab, box, shape):
     Wb, Hb = x1 - x0, y1 - y0
     a = math.radians(abs(ang)); ca, sa = math.cos(a), math.sin(a)
     den = ca * ca - sa * sa
+    gh = float(lab.get('glyph_h') or 0)
     if den < 0.3:
-        return None
-    ln = (Wb * ca - Hb * sa) / den
-    t = (Hb * ca - Wb * sa) / den
+        # The inversion is singular at 45 degrees, and returning None wiped the WHOLE axis-aligned
+        # box: "E Xiang Qian Fold Belt" (-49.8 deg) deleted the map boundary running through its
+        # 188x212 box - and that label is then left blank, so the drawing lost linework for nothing.
+        # The text strip is still known: it runs through the box centre at the label's angle, as thick
+        # as the lettering. Only for the near-45 zone; a vertical label's strip IS its box.
+        if abs(ang) >= 75 or gh <= 0:
+            return None
+        ln, t = math.hypot(Wb, Hb), 1.4 * gh
+    else:
+        ln = (Wb * ca - Hb * sa) / den
+        t = (Hb * ca - Wb * sa) / den
     if ln <= 0 or t <= 0:
         return None
-    if lab.get('glyph_h'):              # loose OCR quads overstate the thickness; glyph size is tighter
-        t = min(t, 1.2 * float(lab['glyph_h']))
+    if gh and den >= 0.3:               # loose OCR quads overstate the thickness; glyph size is tighter
+        t = min(t, 1.2 * gh)
     rect = ((x0 + x1) / 2.0, (y0 + y1) / 2.0), (ln + 2 * S, t + 2 * S), ang
     pts = cv2.boxPoints(rect).astype(np.int32)
     m = np.zeros(shape, np.uint8)
@@ -702,9 +1024,29 @@ def _slant_band(lab, box, shape):
     return m
 
 
-def erase_text(img, labels):
+def _quad_mask(shape, quad, pad=0):
+    """Rasterise a detector polygon, in WORKING pixels. `pad` keeps the anti-aliased rim of the glyphs
+    inside the wipe; it can stay small because the polygon already hugs the text."""
+    if not quad or len(quad) < 3:
+        return None
+    pts = np.array([[float(p[0]), float(p[1])] for p in quad], np.int32)
+    m = np.zeros(shape[:2], np.uint8)
+    cv2.fillPoly(m, [pts], 1)
+    if pad > 0:
+        m = cv2.dilate(m, np.ones((2 * int(pad) + 1, 2 * int(pad) + 1), np.uint8))
+    return m > 0
+
+
+def erase_text(img, labels, protect=None, colour_near=None):
     """Wipe label boxes but keep: underlines (long horizontal runs), straight lines crossing the
-    box, and leader lines entering the box from one side (up to the glyph core)."""
+    box, and leader lines entering the box from one side (up to the glyph core).
+
+    protect: optional bool mask, True = never wipe. Used for dashed rules, whose short segments are
+    shaped exactly like character strokes and would otherwise be eaten along with the text.
+    colour_near: optional bool mask of pixels next to strongly coloured ones. A label printed in
+    colour (its 'color' clearly chromatic) is wiped only there: its glyphs are not in this ink image,
+    so anything else in its box is linework crossing it.
+    """
     H, W = img.shape
     ink = (img < 200).astype(np.uint8)
     hline = _line_mask(ink)
@@ -763,10 +1105,69 @@ def erase_text(img, labels):
                 if last is not None:
                     cv2.line(keep, path[0], last, 1, 2 * S); entering += 1
         box = np.zeros_like(ink); box[y0:y1 + 1, x0:x1 + 1] = 1
-        band = _slant_band(lab, (x0, y0, x1, y1), (H, W))
+        band = _measured_band(lab, (H, W))
+        if band is None:
+            band = _slant_band(lab, (x0, y0, x1, y1), (H, W))
+        if band is not None and g.any():
+            # A strip that misses part of the lettering leaves a ghost the tracer then draws under the
+            # text object (北羌塘 came out twice). The glyph core is letter-shaped by construction, so
+            # adding it to the strip covers the run without widening the wipe back to the whole box.
+            band = band | (cv2.dilate(g, np.ones((2 * S + 1, 2 * S + 1), np.uint8)) > 0).astype(np.uint8)
         if band is not None:            # rotated label: its axis box is mostly map, wipe the text strip only
             box &= band
         wipe = (box > 0) & (keep == 0) & (hline == 0)
+        if band is not None and not _flag('CDR_NO_BAND_ESCAPE'):
+            # Inside the text strip, a letter is contained; a line crossing it runs out of the strip
+            # at both ends. Keep whatever pokes far enough out - that is what cost the inset map its
+            # boundary curves, which no hand edit can restore, while a leftover letter can be deleted.
+            bandd = cv2.dilate(band, np.ones((2 * S + 1, 2 * S + 1), np.uint8)) > 0
+            ys_w, xs_w = np.nonzero(wipe & (ink_nh > 0))
+            if xs_w.size:
+                bx0, by0 = max(int(xs_w.min()) - 2 * S, 0), max(int(ys_w.min()) - 2 * S, 0)
+                bx1, by1 = min(int(xs_w.max()) + 2 * S + 1, W), min(int(ys_w.max()) + 2 * S + 1, H)
+                sub_i = ink_nh[by0:by1, bx0:bx1]
+                nb, cb, stb, _ = cv2.connectedComponentsWithStats(sub_i, 8)
+                out_b = ~bandd[by0:by1, bx0:bx1]
+                wsub = wipe[by0:by1, bx0:bx1]
+                for i in range(1, nb):
+                    comp = cb == i
+                    if not (comp & wsub).any():
+                        continue
+                    out_px = int((comp & out_b).sum())
+                    if out_px >= max(8 * S, int(0.35 * int(comp.sum()))):
+                        wsub[comp] = False
+                wipe[by0:by1, bx0:bx1] = wsub
+        if protect is not None:
+            lab['dash_protect_px'] = int((wipe & protect).sum())
+            wipe = wipe & ~protect
+        if QUAD_WIPE or PROTECT_SHAPE:
+            # Both bound the wipe and are off by default - see the switches at the top of this file.
+            if QUAD_WIPE:
+                qm = _quad_mask(img.shape, lab.get('quad'), pad=S)
+                if qm is not None:
+                    wipe = wipe & qm
+            if PROTECT_SHAPE:
+                protect = _shape_protect_mask(ink_nh, (x0, y0, x1, y1), glyph_h)
+                lab['wipe_protected'] = int((wipe & protect).sum())
+                wipe = wipe & ~protect
+        _c = lab.get('color')
+        if colour_near is not None and _c and max(_c) - min(_c) > 60:
+            wipe = wipe & colour_near
+        # A slanted label with no measured run is left BLANK for a human (see 'unmeasurable'). Wiping
+        # its box then destroys linework and puts nothing in its place - the worst trade in the
+        # pipeline: the inset map's boundary curve went with "E Xiang Qian Fold Belt" and no edit can
+        # bring it back, while leftover lettering is traced as shapes the human deletes in one click
+        # after typing into the magenta TO FILL box. Nothing here is wiped at all. (Limiting the wipe
+        # to the glyph core instead does not work: without a measurement the glyph height is estimated
+        # from the whole box, and a curve through it passes for a letter.)
+        if (MEASURED_TEXT and not lab.get('measured') and lab.get('text')
+                and 4.0 < abs(float(lab.get('angle') or 0.0)) < 75.0):
+            wipe = np.zeros_like(wipe)
+        if lab.get('erase_only'):
+            # Nothing is placed in this box to show what the wipe removed, so blank only the glyph core
+            # and leave every other mark untouched. Narrowing here (rather than wiping the whole box)
+            # also keeps the placement box erase_text derives stable - see _shape_protect_mask.
+            wipe = wipe & (g > 0)
         # text placement box: glyph core (leader stubs must not widen it), unless glyphs fused with
         # lines were left out of the core -> fall back to all wiped ink, capped at the expected width
         exp_w = len(lab.get('text', '')) * glyph_h * 1.05
@@ -789,6 +1190,12 @@ def erase_text(img, labels):
                 comp = cc == i
                 if box[cY0:cY1, cX0:cX1][comp].mean() < 0.5:
                     continue            # mostly outside the label: a map symbol (city dot) beside it
+                if protect is not None and DASH_CRUMB_GUARD and \
+                        protect[cY0:cY1, cX0:cX1][comp].mean() > 0.5:
+                    # this "crumb" is a dash segment the detector vouched for -- keeping it is the whole
+                    # point of the protect mask, and deleting it here is how the rescue silently failed
+                    lab['dash_crumb_kept'] = lab.get('dash_crumb_kept', 0) + int(comp.sum())
+                    continue
                 out[cY0:cY1, cX0:cX1][comp] = 255
         lab['lines_kept'] = {'crossing': crossing, 'entering': entering}
     return _heal_crossings(img, out, labels)
@@ -996,7 +1403,14 @@ LATIN_FONTS = {'Times New Roman': 'C:/Windows/Fonts/times.ttf', 'Arial': 'C:/Win
 
 
 def detect_latin_font(src_gray, labels, default='Times New Roman'):
-    """Proportional font for labels without CJK characters. The CJK font (新宋体) is monospaced: "0.5" came
+    """Proportional font for labels without CJK characters.
+
+    One font per drawing, on purpose. A map may well print two faces (the geology map sets its region
+    names sans and its place names serif), but telling serif from sans PER LABEL was tried and does not
+    work at drawing resolution: the place names are 11 px tall, their serifs are sub-pixel, and both
+    the pixel correlation and a width-per-character test answered by stroke weight instead - every
+    serif place name was called Arial. Callers who know better pass latin_font; a single label can also
+    carry its own 'latin_font' (see label_font in the COM step). The CJK font (新宋体) is monospaced: "0.5" came
     out a character-width wider than the source and ran into axis ticks. Render each Latin label in each
     candidate and correlate with the source glyphs; majority vote, default when unclear. (The same test
     does NOT tell 宋体 from 黑体 reliably at drawing resolutions, so the CJK font is left alone.)"""
@@ -1033,6 +1447,61 @@ def detect_latin_font(src_gray, labels, default='Times New Roman'):
     return default
 
 
+def _quad_for_box(cands, box_src, min_iou=0.3):
+    """The detector polygon belonging to a label, matched back by overlap with its box.
+
+    Labels carry boxes (that is what the caller edits), so a label whose box was changed may not match;
+    returning None then simply means the wipe falls back to the rectangle, which is the old behaviour.
+    """
+    best_iou, best = 0.0, None
+    for cd in cands:
+        b = cd.get('box')
+        q = cd.get('quad')
+        if not b or not q:
+            continue
+        ix = max(0, min(box_src[2], b[2]) - max(box_src[0], b[0]))
+        iy = max(0, min(box_src[3], b[3]) - max(box_src[1], b[1]))
+        inter = ix * iy
+        u = ((box_src[2] - box_src[0]) * (box_src[3] - box_src[1])
+             + (b[2] - b[0]) * (b[3] - b[1]) - inter + 1e-9)
+        if inter / u > best_iou:
+            best_iou, best = inter / u, q
+    return best if best_iou >= min_iou else None
+
+
+def annotate_placement(labels, S):
+    """Pre-compute the placement of every label: what size, angle, position, colour and faux-bold the
+    text object will be given. This is written into labels.json and reported to the calling AI BEFORE
+    the CorelDRAW build, so a wrong size or angle arrives as a number to correct instead of as a
+    surprise on the finished page (the text objects are placed last, on top of everything, so a bad
+    size shows up as text covering the linework).
+
+    Page geometry: 1 source px = 1 pt / S (see cdr_vectorize_com.build), so a label's target width in
+    points is its tight-box width divided by S."""
+    for lab in labels:
+        x0, y0, x1, y1 = lab['tight']
+        w_pt = (x1 - x0) / S
+        h_pt = float(lab.get('text_h') or 0) / S
+        # CJK glyphs are ~1 em wide, Latin/digits ~0.5 em; that ratio is what the width fit lands on,
+        # so this estimate is the value the build starts from instead of an unexplained result.
+        text = lab.get('text', '')
+        n_cjk = sum(1 for ch in text if '\u2e80' <= ch <= '\uffef')
+        n_eff = n_cjk + 0.5 * max(len(text) - n_cjk, 0)
+        size = w_pt / n_eff if n_eff > 0 else h_pt
+        # Reported in SOURCE pixels: the coordinate system of `box`, of every issue region and of the
+        # labels the caller edits. Reporting working pixels here made the two look contradictory.
+        lab['place'] = {
+            'center_px': [round((x0 + x1) / 2.0 / S, 1), round((y0 + y1) / 2.0 / S, 1)],
+            'width_pt': round(w_pt, 1),
+            'height_pt': round(h_pt, 1),
+            'font_size_pt': round(size, 1),
+            'angle': round(float(lab.get('angle') or 0.0), 1),
+            'bold': bool(float(lab.get('bold_px') or 0) > 0),
+            'color': list(lab.get('color') or [0, 0, 0]),
+        }
+    return labels
+
+
 def finalize(out_dir, confirmed):
     """confirmed: list of {text, box:[x0,y0,x1,y1] in SOURCE px} (or a path to such json)."""
     if isinstance(confirmed, str):
@@ -1042,13 +1511,30 @@ def finalize(out_dir, confirmed):
     h, w = imread(os.path.join(out_dir, 'src.png')).shape
     ink = (sr2 < 200).astype(np.uint8)
     ink_nh = ink & (1 - _rule_mask(ink))
+    # detector polygons, matched back to the labels by overlap (the labels themselves carry boxes only)
+    cands = []
+    _cp = os.path.join(out_dir, 'ocr_candidates.json')
+    if os.path.exists(_cp):
+        try:
+            cands = json.loads(open(_cp, encoding='utf-8').read()).get('candidates', [])
+        except Exception:  # noqa: BLE001
+            cands = []
     labels = []
     for c in confirmed:
         text = str(c['text']).strip()
-        if not text:
+        # erasonly: the caller decided a human should type this reading. The box is still wiped from
+        # the image (a leftover ghost would be traced as linework) but no text object is created.
+        erase_only = bool(c.get('erase_only'))
+        if not text and not erase_only:
             continue
         box = [int(v) * S for v in c['box']]
         box = [max(box[0], 0), max(box[1], 0), min(box[2], w * S - 1), min(box[3], h * S - 1)]
+        _q = _quad_for_box(cands, [int(v) for v in c['box']]) if QUAD_WIPE else None
+        quad = [[float(p[0]) * S, float(p[1]) * S] for p in _q] if _q else None
+        if erase_only:
+            labels.append({'text': '', 'box': box, 'angle': float(c.get('angle', 0.0) or 0.0),
+                           'erase_only': True, 'quad': quad})
+            continue
         # OCR often reads adjacent labels as one line: "集流环|测井仪器车|测井仪器板" splits the box
         parts = [p.strip() for p in text.split('|') if p.strip()]
         if len(parts) > 1:
@@ -1059,10 +1545,26 @@ def finalize(out_dir, confirmed):
             # a slanted / vertical OCR box already spans the whole label: growing it sideways would
             # follow neighbouring ink along the wrong axis
             grown = box if abs(ang) > 4 else expand_to_text(ink_nh, box, len(text))
-            labels.append({'text': text, 'box': grown, 'angle': ang})
+            labels.append({'text': text, 'box': grown, 'angle': ang, 'quad': quad})
     for lab in labels:
         lab['text_h'] = measure_text_h(src_bgr, [v // S for v in lab['box']])
-    clean = erase_text(sr2, labels)
+    # Dashed rules are runs of short segments, and a short segment looks exactly like a character
+    # stroke, so the wipe eats the dashes crossing a label box. Find them first and keep those pixels.
+    # Wrapped in try/except on purpose: this is an optional protection, and it must never be the reason
+    # a wipe fails to run.
+    protect = None
+    if DASH_PROTECT:
+        try:
+            import dash_protect
+
+            _sr2_bgr = imread(os.path.join(out_dir, 'sr2_color.png'), cv2.IMREAD_COLOR)
+            protect, _dash_info = dash_protect.build_protect_mask(
+                sr2.shape, dash_protect.find_dashes(sr2, _sr2_bgr),
+                confs=('high',), mode='ink', margin=2,
+                ink=(dash_protect.ink_layer(sr2, _sr2_bgr) > 0))
+        except Exception:  # noqa: BLE001
+            protect = None
+    clean = erase_text(sr2, labels, protect=protect)
     for lab in labels:
         bx0, by0, bx1, by1 = lab['box']
         tx0, ty0, tx1, ty1 = lab['tight']
@@ -1077,8 +1579,10 @@ def finalize(out_dir, confirmed):
                           if abs(lab.get('angle', 0.0)) <= 4 else 0.0)
     marks, clean = extract_fine_marks(clean)
     imwrite(os.path.join(out_dir, 'sr2_no_text.png'), clean)
-    meta = {'src_size': [w, h], 'scale': S, 'labels': labels, 'marks': marks,
-            'latin_font': detect_latin_font(src_gray, labels)}
+    meta = {'src_size': [w, h], 'scale': S, 'labels': annotate_placement(labels, S), 'marks': marks,
+            'latin_font': os.environ.get('CDR_LATIN_FONT') or detect_latin_font(src_gray, labels),
+            # ink the wipe deliberately left alone because it did not look like a character
+            'wipe_protected_px': int(sum(int(l.get('wipe_protected') or 0) for l in labels))}
     with open(os.path.join(out_dir, 'labels.json'), 'w', encoding='utf-8') as f:
         json.dump(meta, f, ensure_ascii=False, indent=1)
     return meta

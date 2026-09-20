@@ -41,9 +41,47 @@ def preprocess(
 
 
 def skeletonize(mask: np.ndarray) -> np.ndarray:
-    """1-pixel wide centerline via Zhang-Suen thinning (opencv-contrib)."""
-    thin = cv2.ximgproc.thinning(mask)
-    return (thin > 0).astype(np.uint8)
+    """1-pixel wide centerline via Zhang-Suen thinning.
+
+    opencv-contrib's cv2.ximgproc.thinning when present; plain opencv-python (what requirements.txt
+    installs, and OpenCV 5 has no thinning at all) gets the same algorithm in numpy below.
+    """
+    thinning = getattr(getattr(cv2, 'ximgproc', None), 'thinning', None)
+    if thinning is not None:
+        return (thinning(mask) > 0).astype(np.uint8)
+    return _zhang_suen((mask > 0).astype(np.uint8))
+
+
+def _zhang_suen(img: np.ndarray) -> np.ndarray:
+    """Zhang-Suen thinning (1984), vectorised; works on the mask's bounding box only."""
+    ys, xs = np.nonzero(img)
+    out = np.zeros_like(img, np.uint8)
+    if ys.size == 0:
+        return out
+    y0, y1, x0, x1 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    a = np.pad(img[y0:y1, x0:x1].astype(np.uint8), 1)
+    while True:
+        changed = False
+        for step in (0, 1):
+            p2, p3, p4 = a[:-2, 1:-1], a[:-2, 2:], a[1:-1, 2:]
+            p5, p6, p7 = a[2:, 2:], a[2:, 1:-1], a[2:, :-2]
+            p8, p9 = a[1:-1, :-2], a[:-2, :-2]
+            nb = [p2, p3, p4, p5, p6, p7, p8, p9]
+            b = sum(n.astype(np.int16) for n in nb)
+            seq = nb + [p2]
+            t = sum(((seq[i] == 0) & (seq[i + 1] == 1)).astype(np.int16) for i in range(8))
+            if step == 0:
+                c1, c2 = p2 * p4 * p6, p4 * p6 * p8
+            else:
+                c1, c2 = p2 * p4 * p8, p2 * p6 * p8
+            kill = (a[1:-1, 1:-1] == 1) & (b >= 2) & (b <= 6) & (t == 1) & (c1 == 0) & (c2 == 0)
+            if kill.any():
+                a[1:-1, 1:-1][kill] = 0
+                changed = True
+        if not changed:
+            break
+    out[y0:y1, x0:x1] = a[1:-1, 1:-1]
+    return out
 
 
 _N8 = [(-1, -1), (-1, 0), (-1, 1), (0, -1), (0, 1), (1, -1), (1, 0), (1, 1)]
@@ -58,8 +96,19 @@ def trace_paths(skel: np.ndarray) -> list[list[tuple[int, int]]]:
     pts = set(zip(*np.nonzero(skel)))  # (y, x)
 
     def nbrs(p):
+        # m-adjacency: a diagonal neighbour counts only when neither shared 4-neighbour is set. With
+        # plain 8-adjacency every stair step of a thinned diagonal is a little triangle, each of its
+        # pixels has degree 3, and the walk shattered one fault line into dozens of 1-2 px paths.
         y, x = p
-        return [(y + dy, x + dx) for dy, dx in _N8 if (y + dy, x + dx) in pts]
+        out = []
+        for dy, dx in _N8:
+            q = (y + dy, x + dx)
+            if q not in pts:
+                continue
+            if dy and dx and ((y + dy, x) in pts or (y, x + dx) in pts):
+                continue
+            out.append(q)
+        return out
 
     deg = {p: len(nbrs(p)) for p in pts}
     nodes = {p for p in pts if deg[p] != 2}

@@ -130,8 +130,14 @@ def text_check(work_dir, labels, scale):
             dets.append(((q[:, 0].min() + q[:, 0].max()) / 2, (q[:, 1].min() + q[:, 1].max()) / 2, t))
         return dets
 
-    res_dets = read_all(_imread(os.path.join(work_dir, 'result.png')), scale)     # result is at working scale
+    # result.png is exported at twice the SOURCE size, which equals the working scale only when the
+    # super-resolution factor happens to be 2. On a large drawing (SR skipped, scale 1) every rendered
+    # detection then landed at double the coordinates of the label boxes, matched nothing, and every
+    # label was reported as "renders as nothing": 61 of 104 on the geology map, all of them false.
+    res_img = _imread(os.path.join(work_dir, 'result.png'))
     src = _imread(os.path.join(work_dir, 'src.png'))
+    res_to_src = (res_img.shape[1] / float(src.shape[1])) if src is not None and src.shape[1] else scale
+    res_dets = read_all(res_img, res_to_src)
     src_dets = read_all(cv2.resize(src, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC), scale)
 
     def read_at(dets, box):
@@ -171,6 +177,142 @@ def text_check(work_dir, labels, scale):
     return bad
 
 
+def _label_boxes_scaled(work_dir):
+    """Label boxes in WORKING pixels (already multiplied by the scale) and that scale."""
+    for name in ('layers.json', 'labels.json'):
+        p = os.path.join(work_dir, name)
+        if os.path.exists(p):
+            meta = json.load(open(p, encoding='utf-8'))
+            return [l['box'] for l in meta.get('labels', [])], float(meta.get('scale', 2))
+    return [], 2.0
+
+
+def wipe_spill(work_dir, limit=8):
+    """Pixels the label wipe removed OUTSIDE every label box.
+
+    erase_text() wipes label boxes to white before PowerTRACE runs, so the graphics are traced from an
+    image the text was cut out of. A box that is too large - or one that was given for a piece of
+    linework rather than for text - therefore deletes linework no later step can bring back, and the
+    final check can only report it as an unexplained "missing graphics". This measures the damage
+    directly so the caller learns that a box is destructive. Boxes are padded by 16 working px, which
+    is the wipe's own margin.
+    """
+    a = os.path.join(work_dir, 'sr2.png')
+    b = os.path.join(work_dir, 'sr2_no_text.png')
+    if not (os.path.exists(a) and os.path.exists(b)):
+        # colour mode wipes the ink layer instead of a single composite image
+        a = os.path.join(work_dir, 'ink_before_wipe.png')
+        b = os.path.join(work_dir, 'ink_no_text.png')
+    if not (os.path.exists(a) and os.path.exists(b)):
+        return None
+    before = _imread(a, cv2.IMREAD_GRAYSCALE)
+    after = _imread(b, cv2.IMREAD_GRAYSCALE)
+    if before.shape != after.shape:
+        return None
+    h, w = before.shape[:2]
+    ink_before = before < 200
+    total_ink = int(ink_before.sum())
+    if total_ink == 0:
+        return None
+    boxes, S = _label_boxes_scaled(work_dir)
+    pad = int(16 * S)
+    zone = np.zeros((h, w), bool)
+    for x0, y0, x1, y1 in boxes:
+        zone[max(int(y0) - pad, 0):int(y1) + pad + 1, max(int(x0) - pad, 0):int(x1) + pad + 1] = True
+    spill = ink_before & ~zone & (after >= 200)
+    n = int(spill.sum())
+    if n < max(60, 0.002 * total_ink):
+        return None
+    return {'px': n, 'share': round(n / total_ink, 4),
+            'regions': _regions(spill, max(12, int(h * w * 0.00005)), limit)}
+
+
+def graphics_self_check(work_dir, trace_stats=None):
+    """CHECKPOINT run BEFORE any text is placed: graphics_only.png against the text-free image that
+    was traced (sr2_no_text.png).
+
+    The final check compares result.png against src.png, where a lost line and a text object sitting on
+    top of a line produce the very same symptom - a hole at those coordinates - so the caller cannot
+    tell whether to change mode/colors or to fix a label. Here the page holds nothing but traced
+    graphics, so every shortfall is a tracing fault and the fix is mode/colors/image quality, never a
+    label edit. Returns None when the checkpoint image is missing.
+    """
+    res_p = os.path.join(work_dir, 'graphics_only.png')
+    if not os.path.exists(res_p):
+        return None
+    # The image that was actually traced. Lineart traces one text-free composite, so that can be
+    # compared over the whole page. Colour mode traces one mask per palette colour and never
+    # materialises such a composite, so it falls back to src.png with the label zones excluded - no
+    # text has been placed yet, so everything outside those zones is still a pure graphics comparison.
+    src_p = os.path.join(work_dir, 'sr2_no_text.png')
+    if os.path.exists(src_p):
+        src = _imread(src_p)
+        zone_boxes: list = []
+    else:
+        src_p = os.path.join(work_dir, 'src.png')
+        if not os.path.exists(src_p):
+            return None
+        src = _imread(src_p)
+        wb, scale = _label_boxes_scaled(work_dir)
+        zone_boxes = [[v / scale for v in b] for b in wb]
+    res = _imread(res_p)
+    metrics, missing, extra, colour_missing, res_s = measure(src, res, zone_boxes)
+    h, w = src.shape[:2]
+    valid = np.ones((h, w), bool)
+    for x0, y0, x1, y1 in zone_boxes:
+        valid[max(int(y0) - 3, 0):int(y1) + 4, max(int(x0) - 3, 0):int(x1) + 4] = False
+    lost = lost_elements(src, res, valid)
+    metrics['lost_elements'] = len(lost)
+    min_area = max(30, int(h * w * 0.0005))
+    issues = []
+    for st in trace_stats or []:
+        if st.get('kind') in ('color', 'ink', 'ink_faint', 'grid') and st.get('curves') == 0:
+            issues.append({'type': 'trace_failed', 'stage': 'graphics', 'layer': st.get('layer'),
+                           'colour': st.get('color'),
+                           'detail': 'PowerTRACE returned no curves for this layer; its content is missing',
+                           'hint': 'rebuild; if it persists try mode="lineart" or report the image size'})
+    if metrics['coverage'] < 0.9:
+        issues.append({'type': 'graphics_missing', 'stage': 'graphics',
+                       'detail': f"only {metrics['coverage']:.0%} of the traced source is reproduced, "
+                                 'measured before any text was placed (red in diff_png)',
+                       'regions': _regions(missing, min_area),
+                       'hint': 'a tracing fault, not a text problem: colour content lost -> '
+                               'mode="color" / colors=16; thin lines lost -> mode="lineart"'})
+    if lost:
+        issues.append({'type': 'lost_elements', 'stage': 'graphics', 'regions': lost[:20],
+                       'detail': f'{len(lost)} small solid element(s) are missing or wrongly coloured '
+                                 'before any text was placed',
+                       'hint': 'a lost colour usually needs a larger colors value, a lost black '
+                               'symbol mode="lineart"'})
+    if metrics['precision'] < 0.9:
+        issues.append({'type': 'graphics_extra', 'stage': 'graphics',
+                       'detail': f"{1 - metrics['precision']:.0%} of the drawn graphics have no "
+                                 'counterpart in the traced source, before any text was placed',
+                       'regions': _regions(extra, min_area),
+                       'hint': 'stray strokes from the trace itself: rebuild; a persistent spike '
+                               'usually means the source needs cropping'})
+    if metrics['colour_recall'] is not None and metrics['colour_recall'] < 0.85:
+        issues.append({'type': 'colour_mismatch', 'stage': 'graphics',
+                       'detail': f"only {metrics['colour_recall']:.0%} of the coloured source area is "
+                                 'drawn in a matching colour',
+                       'regions': _regions(colour_missing, min_area),
+                       'hint': 'rebuild with mode="color" and a larger colors value'})
+    spill = wipe_spill(work_dir)
+    if spill:
+        issues.append({'type': 'wipe_spill', 'stage': 'labels', 'regions': spill['regions'],
+                       'detail': f"{spill['px']} px of linework outside every label box were wiped as "
+                                 'text before tracing, so they cannot appear in the result',
+                       'hint': 'a label box is too large, or was given for linework rather than text: '
+                               'shrink or drop that label and rebuild (editing only its text will not help)'})
+    vis = src.copy()
+    vis[missing] = (0, 0, 255)
+    vis[extra] = (255, 0, 0)
+    vis[colour_missing & ~missing] = (0, 200, 255)
+    diff_png = os.path.join(work_dir, 'graphics_check.png')
+    cv2.imencode('.png', vis)[1].tofile(diff_png)
+    return {'metrics': metrics, 'issues': issues, 'diff_png': diff_png, 'spill': spill}
+
+
 def self_check(work_dir, trace_stats=None):
     """Returns {'metrics', 'issues', 'diff_png'}; issues is [] when nothing looks wrong."""
     src = _imread(os.path.join(work_dir, 'src.png'))
@@ -195,27 +337,31 @@ def self_check(work_dir, trace_stats=None):
     issues = []
     for st in trace_stats or []:
         if st.get('kind') in ('color', 'ink', 'ink_faint', 'grid') and st.get('curves') == 0:
-            issues.append({'type': 'trace_failed', 'layer': st.get('layer'), 'colour': st.get('color'),
+            issues.append({'type': 'trace_failed', 'stage': 'graphics', 'layer': st.get('layer'),
+                           'colour': st.get('color'),
                            'detail': 'PowerTRACE returned no curves for this layer; its content is missing',
                            'hint': 'rebuild; if it persists try mode="lineart" or report the image size'})
     if metrics['coverage'] < 0.9:
-        issues.append({'type': 'missing_graphics', 'detail': f"only {metrics['coverage']:.0%} of the source "
+        issues.append({'type': 'graphics_missing', 'stage': 'graphics',
+                       'detail': f"only {metrics['coverage']:.0%} of the source "
                        'graphics are reproduced (red in diff_png)', 'regions': _regions(missing, min_area),
                        'hint': 'look at diff_png; colour content lost -> try mode="color" / colors=16; '
                                'thin lines lost -> mode="lineart"'})
     if lost:
-        issues.append({'type': 'lost_elements', 'regions': lost[:20],
+        issues.append({'type': 'lost_elements', 'stage': 'graphics', 'regions': lost[:20],
                        'detail': f'{len(lost)} small solid element(s) of the source (dots, symbols, patches) are '
                                  'missing or have the wrong colour in the result',
                        'hint': 'compare these regions on result.png; a lost colour usually needs a larger colors '
                                'value, a lost black symbol mode="lineart"'})
     if metrics['precision'] < 0.9:
-        issues.append({'type': 'extra_graphics', 'detail': f"{1 - metrics['precision']:.0%} of the drawn "
+        issues.append({'type': 'graphics_extra', 'stage': 'graphics',
+                       'detail': f"{1 - metrics['precision']:.0%} of the drawn "
                        'graphics have no counterpart in the source (blue in diff_png)',
                        'regions': _regions(extra, min_area),
                        'hint': 'often leftovers of text that OCR missed or misplaced: fix labels and rebuild'})
     if metrics['colour_recall'] is not None and metrics['colour_recall'] < 0.85:
-        issues.append({'type': 'colour_mismatch', 'detail': f"only {metrics['colour_recall']:.0%} of the "
+        issues.append({'type': 'colour_mismatch', 'stage': 'graphics',
+                       'detail': f"only {metrics['colour_recall']:.0%} of the "
                        'coloured source area is drawn in a matching colour', 'regions': _regions(colour_missing, min_area),
                        'hint': 'rebuild with mode="color" and a larger colors value'})
     try:
@@ -223,7 +369,7 @@ def self_check(work_dir, trace_stats=None):
     except Exception:  # noqa: BLE001 - OCR unavailable: skip the text part
         bad_text = []
     if bad_text:
-        issues.append({'type': 'text_mismatch', 'labels': bad_text[:20],
+        issues.append({'type': 'text_mismatch', 'stage': 'text', 'labels': bad_text[:20],
                        'detail': f'{len(bad_text)} placed label(s) do not read back as placed (overlap, size or '
                                  'missing glyphs)',
                        'hint': 'check these boxes on result.png; fix the text/box in labels and rebuild, or '
