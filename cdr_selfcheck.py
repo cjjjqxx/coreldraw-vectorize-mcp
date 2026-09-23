@@ -265,6 +265,16 @@ def graphics_self_check(work_dir, trace_stats=None):
     metrics['lost_elements'] = len(lost)
     min_area = max(30, int(h * w * 0.0005))
     issues = []
+    # Structural check: coverage says 0.999 while every arrowhead is missing or a box is painted black,
+    # because those are tiny areas or "content where content belongs". cdr_struct compares ELEMENTS.
+    try:
+        import cdr_struct
+        struct = cdr_struct.check(src, res, zone_boxes)
+        metrics['struct'] = {k: v for k, v in struct.items() if not k.endswith('regions')}
+        n_obj = sum(int(st.get('curves') or 0) + int(st.get('lines') or 0) for st in (trace_stats or []))
+        issues.extend(cdr_struct.issues(struct, objects=n_obj or None))
+    except Exception as exc:  # noqa: BLE001 - never fail a build over the check itself
+        metrics['struct_error'] = repr(exc)[:200]
     for st in trace_stats or []:
         if st.get('kind') in ('color', 'ink', 'ink_faint', 'grid') and st.get('curves') == 0:
             issues.append({'type': 'trace_failed', 'stage': 'graphics', 'layer': st.get('layer'),

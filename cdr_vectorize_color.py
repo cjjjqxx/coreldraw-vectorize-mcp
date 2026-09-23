@@ -705,6 +705,106 @@ def glyph_mask_colour(bgr, labels, S, close_px=21, diff_thr=35, measure_only=Fal
     return out
 
 
+def _chain_polylines(polylines, tol):
+    """Join skeleton paths that meet end to end into longer polylines.
+
+    The skeleton walk splits a line at every junction, so the outline around a few strata bands came out
+    as 753 separate polylines, 462 of them under 10 px - each an object in the CDR. At a junction the two
+    paths that continue each other most straightly are joined (a T keeps its stem separate); nothing is
+    removed, only the number of pieces drops."""
+    pls = [list(p) for p in polylines if len(p) >= 4]
+    if len(pls) < 2:
+        return pls
+
+    def ends(p):
+        return (p[0], p[1]), (p[-2], p[-1])
+
+    def outdir(p, at_start):
+        # direction pointing OUT of the polyline at that end, over its first ~3 vertices
+        if at_start:
+            a, b = (p[0], p[1]), (p[min(4, len(p) - 2)], p[min(5, len(p) - 1)])
+        else:
+            a, b = (p[-2], p[-1]), (p[max(len(p) - 6, 0)], p[max(len(p) - 5, 1)])
+        dx, dy = a[0] - b[0], a[1] - b[1]
+        n = math.hypot(dx, dy) or 1.0
+        return dx / n, dy / n
+
+    # candidate joints: endpoint pairs within tol (grid-bucketed), best continuation first, one join per end
+    E = []                                        # (x, y, poly index, at_start)
+    for i, p in enumerate(pls):
+        E.append((p[0], p[1], i, True))
+        E.append((p[-2], p[-1], i, False))
+    grid = {}
+    for k, (x, y, _i, _s) in enumerate(E):
+        grid.setdefault((int(x // tol), int(y // tol)), []).append(k)
+    pairs = []
+    for a, (xa, ya, ia, sa) in enumerate(E):
+        gx, gy = int(xa // tol), int(ya // tol)
+        for ox in (-1, 0, 1):
+            for oy in (-1, 0, 1):
+                for b in grid.get((gx + ox, gy + oy), ()):
+                    if b <= a:
+                        continue
+                    xb, yb, ib, sb = E[b]
+                    if ia == ib or math.hypot(xa - xb, ya - yb) > tol:
+                        continue
+                    da, db = outdir(pls[ia], sa), outdir(pls[ib], sb)
+                    straight = -(da[0] * db[0] + da[1] * db[1])      # 1 = the two continue each other
+                    if straight > 0.5:
+                        pairs.append((straight, a, b))
+    pairs.sort(reverse=True)
+    link = {}                                     # endpoint -> endpoint it is joined to
+    parent = list(range(len(pls)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+    for _st, a, b in pairs:
+        if a in link or b in link:
+            continue
+        ra, rb = root(E[a][2]), root(E[b][2])
+        if ra == rb:
+            continue                              # would close a loop of pieces
+        link[a], link[b] = b, a
+        parent[ra] = rb
+    # walk each chain from a free end
+    out, seen = [], set()
+
+    def endpoint(i, at_start):
+        return 2 * i + (0 if at_start else 1)
+    for i in range(len(pls)):
+        if i in seen:
+            continue
+        # find a free end of this chain
+        cur, start_end = i, endpoint(i, True)
+        visited = {i}
+        while start_end in link:
+            nxt = link[start_end]
+            j, js = E[nxt][2], E[nxt][3]
+            if j in visited:
+                break
+            visited.add(j)
+            cur, start_end = j, endpoint(j, not js)
+        # walk forward from start_end
+        chain, e = [], start_end
+        while True:
+            j, js = E[e][2], E[e][3]
+            if j in seen:
+                break
+            seen.add(j)
+            p = pls[j] if js else [v for k in range(len(pls[j]) - 2, -1, -2) for v in pls[j][k:k + 2]]
+            chain.extend(p if not chain else p[2:])
+            far = endpoint(j, not js)
+            if far not in link:
+                break
+            e = link[far]
+        if chain:
+            out.append(chain)
+    return out
+
+
 def line_strokes(mask, rgb):
     """Centerline strokes for a colour layer that is nothing but thin lines (fault lines), or None.
 
@@ -742,13 +842,215 @@ def line_strokes(mask, rgb):
         return None
     polylines = []
     for path in sk.trace_paths(skel):
-        if len(path) < 3 * S:
+        if len(path) < 5 * S:             # junction spurs; 5% of the rim length on the geology section
             continue
         ap = sk._simplify(path, 0.7 * S).reshape(-1, 2)
         polylines.append([float(v) for xy in ap for v in xy])
+    polylines = _chain_polylines(polylines, 2.0 * S)
     if not polylines:
         return None
     return {'polylines': polylines, 'width_px': round(max(width, 1.0), 2), 'color': list(rgb)}
+
+
+def dashed_strokes(mask, rgb):
+    """Straight dashed lines of a colour layer as vector strokes: (strokes, rest_mask) or None.
+
+    line_strokes() only takes LONG lines, so a layer of dashed faults (each dash ~15 px) fell through to
+    outline tracing: one filled shape per dash, 243 of them on a simple geological section, where the
+    drawing has fifteen lines. Here collinear dashes are chained into one straight line each, drawn later
+    as a single stroke with a dash pattern. Pieces no chain explains (a stray dot, a curved rim) come back
+    in rest_mask and are traced as before, so nothing is dropped. The layer qualifies only if the chains
+    account for most of its pixels - a scatter of short strokes is not a set of dashed lines.
+    """
+    m = (mask > 0).astype(np.uint8)
+    area = int(m.sum())
+    if area < 60 * S * S:
+        return None
+    n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+    if n < 7:
+        return None
+    dashes = []                                   # (comp, cx, cy, ux, uy, length, width, area)
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if a < 4 * S * S or max(w, h) > 60 * S:
+            continue
+        ys, xs = np.nonzero(lab[y:y + h, x:x + w] == i)
+        xs = xs + x
+        ys = ys + y
+        cx, cy = float(xs.mean()), float(ys.mean())
+        ev, evec = np.linalg.eigh(np.cov(np.vstack([xs - cx, ys - cy])))
+        ln, wd = 4 * math.sqrt(max(ev[1], 1e-6)), 4 * math.sqrt(max(ev[0], 1e-6))
+        dashes.append((i, cx, cy, float(evec[0, 1]), float(evec[1, 1]), ln, wd, int(a)))
+    if len(dashes) < 6:
+        return None
+    P = np.array([[d[1], d[2]] for d in dashes])
+    U = np.array([[d[3], d[4]] for d in dashes])
+    used, lines = set(), []
+    for j in sorted(range(len(dashes)), key=lambda q: -dashes[q][5]):
+        if j in used or dashes[j][5] < 2.0 * dashes[j][6]:
+            continue                              # a dot gives no direction to seed a line with
+        ux, uy = dashes[j][3], dashes[j][4]
+        ox, oy = dashes[j][1], dashes[j][2]
+        members = [j]
+        for _ in range(3):                        # grow, refit the axis on the members, grow again
+            rel = P - [ox, oy]
+            t = rel @ [ux, uy]
+            off = np.abs(rel @ [-uy, ux])
+            para = np.abs(U @ [ux, uy])
+            cand = [q for q in range(len(dashes)) if q == j or (
+                q not in used and off[q] <= 3.0 * S and para[q] > 0.9)]
+            order = sorted(cand, key=lambda q: t[q])
+            si = order.index(j)
+            maxgap = 3.0 * max(float(np.median([dashes[q][5] for q in order])), 4.0 * S)
+            lo = hi = si
+            while lo > 0 and t[order[lo]] - t[order[lo - 1]] <= maxgap:
+                lo -= 1
+            while hi < len(order) - 1 and t[order[hi + 1]] - t[order[hi]] <= maxgap:
+                hi += 1
+            members = order[lo:hi + 1]
+            if len(members) < 2:
+                break
+            c0 = P[members].mean(axis=0)
+            _, _, vt = np.linalg.svd(P[members] - c0)
+            ux, uy = float(vt[0][0]), float(vt[0][1])
+            ox, oy = float(c0[0]), float(c0[1])
+        if len(members) < 3:
+            continue
+        spans, lens = [], []
+        for q in members:
+            i = dashes[q][0]
+            x, y, w, h, a = st[i]
+            ys, xs = np.nonzero(lab[y:y + h, x:x + w] == i)
+            tq = (xs + x - ox) * ux + (ys + y - oy) * uy
+            spans.append((float(tq.min()), float(tq.max())))
+            lens.append(float(tq.max() - tq.min() + 1))
+        spans.sort()
+        gaps = [spans[q + 1][0] - spans[q][1] - 1 for q in range(len(spans) - 1)]
+        gaps = [g for g in gaps if g > 0]
+        t0, t1 = spans[0][0], spans[-1][1]
+        used.update(members)
+        lines.append({'pl': [ox + ux * t0, oy + uy * t0, ox + ux * t1, oy + uy * t1],
+                      'dash': float(np.median(lens)), 'gap': float(np.median(gaps)) if gaps else 0.0,
+                      'width': float(np.median([dashes[q][7] / max(lens[k], 1.0) for k, q in enumerate(members)])),
+                      'comps': [dashes[q][0] for q in members]})
+    if len(lines) < 3:
+        return None
+    # one drawing, one fault style: chains whose width or rhythm disagrees with the majority are a
+    # rim or a frame edge that happened to line up (sea-floor outline: width 1.0, gap 52 vs 2.6 / 3)
+    mw = float(np.median([l['width'] for l in lines]))
+    md = float(np.median([l['dash'] for l in lines]))
+    mg = float(np.median([l['gap'] for l in lines]))
+    lines = [l for l in lines if 0.6 * mw <= l['width'] <= 1.6 * mw and l['gap'] <= max(2.0 * mg, 0.6 * md)]
+    if len(lines) < 3:
+        return None
+    covered = np.isin(lab, [i for l in lines for i in l['comps']])
+    if float(covered.sum()) < 0.6 * area:
+        return None
+    rest = (m.astype(bool) & ~covered).astype(np.uint8)
+    strokes = {'polylines': [[round(v, 1) for v in l['pl']] for l in lines], 'width_px': round(mw, 2),
+               'color': list(rgb), 'dash': [round(md, 1), round(max(mg, 1.0), 1)]}
+    return strokes, rest
+
+
+def drop_boundary_slivers(masks, others, bgr):
+    """Remove the thin crumbs a flat-colour drawing leaves in its colour layers, in place.
+
+    Where two flat regions meet, the anti-aliased pixels have an in-between colour, and they land in
+    whatever cluster is nearest: between red and yellow that is orange, so the orange shale layer of a
+    geological section came out as 2 real bands plus 500 slivers, each traced as its own curve (2274
+    curves for a drawing of ~200 objects). A sliver is thin (nothing survives a 3x3 erosion), small, and
+    sits ON A BOUNDARY: its ring touches at least two other regions. A real small patch - a JPEG-faded
+    map patch, a symbol - is surrounded by one colour and stays. Only layers made of solid areas are
+    cleaned; in a line layer the thin pieces are the content. Freed pixels go to the neighbouring region
+    that took over, so no white seam opens where a sliver was. Returns the number of slivers removed.
+
+    Thin is not enough: the red wavy arrows of the same section are thin, lie on the tan/rim boundary and
+    were repainted yellow. A sliver's colour is a BLEND of the two regions it separates (orange between
+    red and yellow); a real thin element has its own colour, far from every such blend.
+    """
+    keys = list(masks)
+    if not keys:
+        return 0
+    h, w = next(iter(masks.values())).shape
+    owner = np.zeros((h, w), np.int32)            # 0 = paper, 1.. = colour layers, -1.. = others
+    for j, k in enumerate(keys):
+        owner[masks[k] > 0] = j + 1
+    for j, o in enumerate(others):
+        owner[(o > 0) & (owner == 0)] = -(j + 1)
+    col = {0: np.array([255.0, 255.0, 255.0])}
+    for j, k in enumerate(keys):
+        px = bgr[masks[k] > 0]
+        col[j + 1] = np.median(px, axis=0) if len(px) else col[0]
+    for j, o in enumerate(others):
+        px = bgr[(o > 0) & (owner == -(j + 1))]
+        col[-(j + 1)] = np.median(px, axis=0) if len(px) else col[0]
+
+    def is_blend(c, ids_):
+        for p_ in range(len(ids_)):
+            for q_ in range(p_ + 1, len(ids_)):
+                a_, b_ = col[int(ids_[p_])], col[int(ids_[q_])]
+                ab = b_ - a_
+                t_ = float(np.dot(c - a_, ab) / max(float(np.dot(ab, ab)), 1.0))
+                if 0.05 <= t_ <= 0.95 and float(np.linalg.norm(a_ + t_ * ab - c)) < 30.0:
+                    return True
+        return False
+    k3 = np.ones((3, 3), np.uint8)
+    ell = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (4 * S + 3, 4 * S + 3))
+    solid = [k for k in keys if masks[k].any() and float(cv2.erode((masks[k] > 0).astype(np.uint8), ell).sum())
+             >= 0.3 * float((masks[k] > 0).sum())]
+    freed = np.zeros((h, w), bool)
+    removed = 0
+    for j, k in enumerate(keys):
+        m = (masks[k] > 0).astype(np.uint8)
+        a_all = int(m.sum())
+        if a_all == 0 or float(cv2.erode(m, ell).sum()) < 0.3 * a_all:
+            continue                              # not a layer of solid areas
+        n, lab, st, _ = cv2.connectedComponentsWithStats(m, 8)
+        core = cv2.erode(m, k3)
+        for i in range(1, n):
+            x, y, bw, bh, a = st[i]
+            if a >= 150 * S * S:
+                continue
+            x0, y0, x1, y1 = max(x - 2, 0), max(y - 2, 0), min(x + bw + 2, w), min(y + bh + 2, h)
+            comp = lab[y0:y1, x0:x1] == i
+            ring = (cv2.dilate(comp.astype(np.uint8), k3) > 0) & ~comp
+            ids, cnt = np.unique(owner[y0:y1, x0:x1][ring], return_counts=True)
+            if int(core[y0:y1, x0:x1][comp].sum()) > max(2, 0.1 * a):
+                continue                          # has a body: a real small element
+            sel = (ids != j + 1) & (cnt >= max(1, 0.15 * cnt.sum()))
+            # 1-3 px specks go even inside one colour (a faint dotted line in the sandstone came out as
+            # orange dots); the smallest real patch kept elsewhere (clean_mask) is S*S with a body
+            own = bgr[y0:y1, x0:x1][comp].astype(np.float64).mean(axis=0)   # the sliver's real colour
+            if a >= 4 * S * S and (int(sel.sum()) < 2 or not is_blend(own, ids[sel])):
+                continue                          # one colour around it, or a colour of its own: keep
+            m[y0:y1, x0:x1][comp] = 0
+            freed[y0:y1, x0:x1] |= comp
+            removed += 1
+        masks[k] = m
+    # Seams: pixels no layer owns but that lie INSIDE the drawing (enclosed, small) showed as white
+    # hairlines along every band and as a white hole where a patch had been. Paper proper - the margin,
+    # a legend's background - is one large unowned area and stays. Freed sliver pixels join the seams.
+    owned = owner != 0
+    for k in keys:
+        owned |= masks[k] > 0
+    n_, lab_, st_, _ = cv2.connectedComponentsWithStats((~owned).astype(np.uint8), 4)
+    seam = np.zeros((h, w), bool)
+    for i in range(1, n_):
+        x, y, bw, bh, a = st_[i]
+        touches = x == 0 or y == 0 or x + bw >= w or y + bh >= h
+        if not touches and a <= 400 * S * S:
+            seam[y:y + bh, x:x + bw] |= lab_[y:y + bh, x:x + bw] == i
+    # hand freed and seam pixels to the adjacent solid colour layer, a ring at a time, largest first
+    left = freed | seam
+    for _ in range(6 * S):
+        if not left.any():
+            break
+        for k in sorted(solid, key=lambda k_: -int(masks[k_].sum())):
+            grow = (cv2.dilate(masks[k], k3) > 0) & left
+            if grow.any():
+                masks[k] = (masks[k].astype(bool) | grow).astype(np.uint8)
+                left &= ~grow
+    return removed
 
 
 def _left_square(src_gray, box, S, alone=False, gray_all=None):
@@ -1577,6 +1879,103 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
     drawn_px = (ink_mask > 0) | (faint_mask > 0)
     for i_ in line_ids:
         drawn_px |= cmasks[i_] > 0
+    # Text wipe works on the INK image, and only on pixels dark enough to be ink. The lighter anti-aliased
+    # rim of grey lettering stays in the colour image, lands in grey clusters (a rim-line layer, the coal
+    # band) and is traced into a faint copy of the old text under the new text object. Whatever piece of a
+    # layer lies wholly inside a label box is that rim: remove it (the seam fill below closes the hole).
+    # A line that crosses the label also runs outside the box and is left alone.
+    # Judged against the UNION of the boxes: stacked labels ("岩性" over "油气藏") share one blob of rim
+    # that touches each box's edge but never leaves the text area.
+    tzone = np.zeros((h2, w2), bool)
+    for lab_ in labels:
+        bx0, by0, bx1, by1 = lab_.get('box', lab_.get('tight'))
+        tzone[max(by0 - S, 0):by1 + S + 1, max(bx0 - S, 0):bx1 + S + 1] = True
+    # Colour layers only, and only pieces the LABEL'S OWN INK colour: a legend symbol that happens to sit
+    # inside a text box (the map's circle-and-dot marker, a small orange patch) is not text and must stay.
+    # The ink layer keeps erase_text's own protections instead.
+    # A rim of wiped text is the label's ink BLENDED with what is behind it, so test against that segment,
+    # not against the ink colour itself (the rim measured 100 units away from it).
+    lab_img = cv2.cvtColor(bgr_orig, cv2.COLOR_BGR2LAB).astype(np.float32)
+    tcols = []
+    for lab_ in labels:
+        c_ = lab_.get('color')
+        if not c_:
+            continue
+        bx0, by0, bx1, by1 = [int(v) for v in (lab_.get('box') or lab_['tight'])]
+        ry0, ry1 = max(by0 - 6, 0), min(by1 + 7, h2)
+        rx0, rx1 = max(bx0 - 6, 0), min(bx1 + 7, w2)
+        ring = np.ones((ry1 - ry0, rx1 - rx0), bool)
+        ring[max(by0 - ry0, 0):by1 - ry0 + 1, max(bx0 - rx0, 0):bx1 - rx0 + 1] = False
+        px = lab_img[ry0:ry1, rx0:rx1][ring]
+        if len(px) < 10:
+            continue
+        tcols.append((cv2.cvtColor(np.uint8([[list(c_)[::-1]]]), cv2.COLOR_BGR2LAB)[0, 0].astype(np.float32),
+                      np.median(px, axis=0).astype(np.float32)))
+    if tzone.any() and tcols:
+        for tgt in [cmasks[i_] for i_ in cmasks] + [fm_ for _i, fm_ in fills]:
+            if not (tgt[tzone] > 0).any():
+                continue
+            n_, lb_ = cv2.connectedComponents((tgt > 0).astype(np.uint8), connectivity=8)
+            outside = set(np.unique(lb_[(tgt > 0) & ~tzone]).tolist())
+            inside = set(np.unique(lb_[(tgt > 0) & tzone]).tolist()) - {0}
+            gone = []
+            for q in inside:
+                if q in outside:
+                    continue
+                px = lab_img[lb_ == q]
+                if len(px) == 0:
+                    continue
+                med = np.median(px, axis=0).astype(np.float32)
+                for tc, bg in tcols:
+                    ab = bg - tc
+                    t_ = float(np.clip(np.dot(med - tc, ab) / max(float(np.dot(ab, ab)), 1.0), 0, 1))
+                    if float(np.linalg.norm(tc + t_ * ab - med)) < 20:
+                        gone.append(q)            # ink of a label blended with its background: a rim
+                        break
+            if gone:
+                tgt[np.isin(lb_, gone)] = 0
+    solid_masks = {('c', i_): cmasks[i_] for i_ in cmasks if i_ not in line_ids}
+    solid_masks.update({('f', j_): fm_ for j_, (_i, fm_) in enumerate(fills)})
+    slivers = drop_boundary_slivers(solid_masks, [ink_mask, faint_mask] + [cmasks[i_] for i_ in line_ids],
+                                     cv2.resize(bgr_orig, (w2, h2), interpolation=cv2.INTER_NEAREST))
+    # Underpaint. Layers are traced one at a time and painted big-first, so two neighbouring regions meet
+    # along two independently traced edges that never coincide: paper shows through as a white hairline
+    # along every band. Each region is therefore extended under the holes that the regions painted on
+    # top of it fill - the seam then shows the colour beneath, not paper. Holes nothing covers (a white
+    # island in the drawing) stay holes.
+    order_ = sorted(solid_masks, key=lambda k_: -int((solid_masks[k_] > 0).sum()))
+    above = np.zeros((h2, w2), bool)
+    for m_ in [ink_mask, faint_mask] + [cmasks[i_] for i_ in line_ids]:
+        above |= m_ > 0
+    tops = {}
+    acc = above.copy()
+    for k_ in reversed(order_):                   # smallest first: what lies above each layer
+        tops[k_] = acc.copy()
+        acc |= solid_masks[k_] > 0
+    kd = np.ones((2 * S + 1, 2 * S + 1), np.uint8)
+    for k_ in order_:
+        m_ = (solid_masks[k_] > 0).astype(np.uint8)
+        if not m_.any():
+            continue
+        cnts_, hier_ = cv2.findContours(m_, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if hier_ is None:
+            continue
+        cover = cv2.dilate(tops[k_].astype(np.uint8), kd) > 0
+        for q, hq in enumerate(hier_[0]):
+            if hq[3] < 0:
+                continue                          # outer contour
+            hole = np.zeros_like(m_)
+            cv2.drawContours(hole, cnts_, q, 1, -1)
+            hole = (hole > 0) & (m_ == 0)
+            hn = int(hole.sum())
+            if hn and float((hole & cover).sum()) >= 0.95 * hn:
+                m_[hole] = 1
+        solid_masks[k_] = m_
+    for (src_, j_), m_ in solid_masks.items():
+        if src_ == 'c':
+            cmasks[j_] = m_
+        else:
+            fills[j_] = (fills[j_][0], m_)
     for i, (c, kind) in enumerate(zip(centers, kinds)):
         if kind == 'grid':
             if grid_done or not grid_mask.any() or rules_meta:
@@ -1603,14 +2002,26 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
         imwrite(os.path.join(work_dir, f), np.where(mask > 0, 0, 255).astype(np.uint8))
         entry = {'file': f, 'kind': kind, 'area': area, 'color': [int(rgb[0]), int(rgb[1]), int(rgb[2])]}
         strokes = line_strokes(mask, entry['color']) if kind == 'color' else None
+        rest = None
+        if not strokes and kind == 'color':
+            dashed = dashed_strokes(mask, entry['color'])
+            if dashed:
+                strokes, rest = dashed
         if strokes:
             entry['strokes'] = strokes
+            if rest is not None and int(rest.sum()) >= min_area:
+                # what the dash chains do not explain is still traced, so nothing of the layer is lost
+                fr = 'layers/layer_%02d_rest.png' % i
+                imwrite(os.path.join(work_dir, fr), np.where(rest > 0, 0, 255).astype(np.uint8))
+                entry['rest_file'] = fr
         elif kind == 'color':
             rim = patch_outline(src_bgr, mask, entry['color'], drawn=drawn_px)
             if rim:
                 entry['outline'] = {'color': rim, 'width_px': float(S)}      # ~1 source px
         layers.append(entry)
     for i, fm in fills:
+        if not fm.any():
+            continue                              # emptied: it was only the rim of wiped text
         f = 'layers/layer_%02d_fill.png' % i
         imwrite(os.path.join(work_dir, f), np.where(fm > 0, 0, 255).astype(np.uint8))
         layers.append({'file': f, 'kind': 'color', 'area': int(fm.sum()), 'color': interior_color(bgr_orig, fm)})
@@ -1649,16 +2060,43 @@ def build_layers(work_dir, confirmed, colors=6, min_region_px=None):
             'colour_restored_px': int(restored_px),
             'labels_hue_split': int(split_labels),
             'fringe_layers_dropped': int(fringe_layers),
+            'boundary_slivers_dropped': int(slivers),
             'labels': annotate_placement(out_labels, S)}
     with open(os.path.join(work_dir, 'layers.json'), 'w', encoding='utf-8') as fh:
         json.dump(meta, fh, ensure_ascii=False, indent=1)
     return meta
 
 
+
+def maybe_flat(work_dir, meta):
+    """Switch a flat-colour drawing to the region model (cdr_flat): CDR_FLAT=1 forces it, 0 disables it,
+    unset decides by flat_score(). The labels measured by build_layers() are kept either way."""
+    flag = os.environ.get('CDR_FLAT', '').strip()
+    if flag == '0':
+        return meta
+    import cdr_flat
+    src = imread(os.path.join(work_dir, 'src.png'), cv2.IMREAD_COLOR)
+    ok, stats = cdr_flat.flat_score(src)
+    meta['flat_score'] = stats
+    if flag != '1' and not ok:
+        return meta
+    try:
+        res = cdr_flat.build_flat(work_dir, meta, S=int(meta.get('scale') or S), log=lambda *a: None)
+    except Exception as exc:  # noqa: BLE001 - the layer model is still there to fall back on
+        meta['flat_error'] = repr(exc)[:300]
+        return meta
+    if res.get('flat') is False:
+        return meta
+    with open(os.path.join(work_dir, 'layers.json'), 'w', encoding='utf-8') as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=1)
+    return meta
+
 if __name__ == '__main__':
     if sys.argv[1] == 'layers':
         m = build_layers(sys.argv[2], sys.argv[3], int(sys.argv[4]) if len(sys.argv) > 4 else 6)
-        print(json.dumps({'layers': [{k: v for k, v in l.items() if k != 'file'} for l in m['layers']],
-                          'labels': len(m['labels'])}, ensure_ascii=False))
+        maybe_flat(sys.argv[2], m)
+        print(json.dumps({'layers': [{k: v for k, v in l.items() if k not in ('file', 'shapes', 'strokes')}
+                                     for l in m['layers']],
+                          'flat': m.get('flat'), 'labels': len(m['labels'])}, ensure_ascii=False))
     else:
         raise SystemExit(__doc__)

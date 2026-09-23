@@ -506,6 +506,17 @@ def normalize_paper(bgr):
     paper = estimate_paper(bgr)
     if paper.min() >= 245 and paper.max() - paper.min() < 8:
         return bgr, None
+    # The dominant light colour is not always paper: in a section/map whose frame is filled with a pale
+    # colour (sediment tan, 219,218,187) that fill outweighs the white margin and legend. Scaling it to
+    # white bleached every colour and dropped the fill as background. A tinted scan has no true white
+    # (measured 0.000 on g_scanned); a white-paper figure keeps white margins (this one: 17.7% white,
+    # 73% of the border ring) - so if white paper is really there, the image is already normalised.
+    mn, mx = bgr.min(axis=2).astype(np.int16), bgr.max(axis=2).astype(np.int16)
+    white = (mn >= 240) & (mx - mn <= 12)
+    b = max(2, int(0.02 * min(white.shape)))
+    ring = np.concatenate([white[:b].ravel(), white[-b:].ravel(), white[:, :b].ravel(), white[:, -b:].ravel()])
+    if float(white.mean()) >= 0.03 or float(ring.mean()) >= 0.3:
+        return bgr, None
     out = np.clip(bgr.astype(np.float32) * (255.0 / np.maximum(paper, 1.0)), 0, 255).astype(np.uint8)
     return out, [int(v) for v in paper]
 
@@ -1115,7 +1126,20 @@ def erase_text(img, labels, protect=None, colour_near=None):
             band = band | (cv2.dilate(g, np.ones((2 * S + 1, 2 * S + 1), np.uint8)) > 0).astype(np.uint8)
         if band is not None:            # rotated label: its axis box is mostly map, wipe the text strip only
             box &= band
-        wipe = (box > 0) & (keep == 0) & (hline == 0)
+        # A horizontal run is kept as an underline / crossing rule only if it behaves like one: it leaves
+        # the box, or spans the text row. At S=1 the 18 px run test also matches the strokes of large CJK
+        # glyphs (气, 藏, 岩 at 36-39 px): kept, they were traced as a ladder of lines under the new text.
+        hl = np.zeros_like(ink)
+        HX0, HY0, HX1, HY1 = max(x0 - pad, 0), max(y0 - pad, 0), min(x1 + pad, W - 1), min(y1 + pad, H - 1)
+        nh, ch, sth, _ = cv2.connectedComponentsWithStats(hline[HY0:HY1 + 1, HX0:HX1 + 1], 8)
+        for i in range(1, nh):
+            hx, hy, hw, hh_, _a = sth[i]
+            ax0, ax1 = hx + HX0, hx + HX0 + hw - 1
+            leaves = ax0 < x0 - 3 * S or ax1 > x1 + 3 * S
+            spans = hw >= 0.8 * (x1 - x0) and hw >= 2.5 * max(glyph_h, 1)
+            if leaves or spans:
+                hl[HY0:HY1 + 1, HX0:HX1 + 1][ch == i] = 1
+        wipe = (box > 0) & (keep == 0) & (hl == 0)
         if band is not None and not _flag('CDR_NO_BAND_ESCAPE'):
             # Inside the text strip, a letter is contained; a line crossing it runs out of the strip
             # at both ends. Keep whatever pokes far enough out - that is what cost the inset map its

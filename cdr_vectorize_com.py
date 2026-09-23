@@ -380,12 +380,101 @@ def export_page_png(app, doc, page_w, page_h, png_path, px_w, px_h):
     cv2.imencode('.png', out)[1].tofile(png_path)
 
 
+def draw_regions(app, doc, layer, shapes, k, page_h):
+    """Flat-colour regions (cdr_flat) drawn directly as filled Bezier curves - no PowerTRACE. Shapes arrive
+    in paint order (outer first); each is one closed path, optionally with the source's rim as outline.
+    Returns (curves, nodes)."""
+    made, nodes, outlined = [], 0, []
+    cols = {}
+    for s in shapes:
+        paths = s.get('paths') or [{'start': s.get('start'), 'segs': s.get('segs') or []}]
+        paths = [p_ for p_ in paths if p_.get('start') and len(p_.get('segs') or []) >= 2]
+        if not paths:
+            continue
+        try:
+            crv = app.CreateCurve(doc)
+            for p_ in paths:                      # outer contour, then its holes (even-odd fill)
+                x0, y0 = p_['start']
+                sp = crv.CreateSubPath(x0 * k, page_h - y0 * k)
+                for x, y, c1x, c1y, c2x, c2y in p_['segs']:
+                    sp.AppendCurveSegment2(x * k, page_h - y * k, c1x * k, page_h - c1y * k,
+                                           c2x * k, page_h - c2y * k)
+                sp.Closed = True
+            sh = layer.CreateCurve(crv)
+        except Exception:  # noqa: BLE001 - one bad shape must not cost the drawing
+            continue
+        segs = [q for p_ in paths for q in p_['segs']]
+        key = tuple(s['color'])
+        if key not in cols:
+            c = app.CreateColor(); c.RGBAssign(*[int(v) for v in s['color']]); cols[key] = c
+        sh.Fill.ApplyUniformFill(cols[key])
+        sh.Outline.SetNoOutline()
+        if s.get('outline'):
+            outlined.append((paths, s['outline']))
+        made.append(sh)
+        nodes += len(segs)
+    # Outlines in a SECOND pass, on top of every fill. A frame that the model represents as a ring-shaped
+    # region is the largest shape and is therefore painted first; with its outline attached, every later
+    # fill covered the figure's own border, and only the element-level check noticed.
+    for paths, ol in outlined:
+        try:
+            crv = app.CreateCurve(doc)
+            for p_ in paths:
+                x0, y0 = p_['start']
+                sp = crv.CreateSubPath(x0 * k, page_h - y0 * k)
+                for x, y, c1x, c1y, c2x, c2y in p_['segs']:
+                    sp.AppendCurveSegment2(x * k, page_h - y * k, c1x * k, page_h - c1y * k,
+                                           c2x * k, page_h - c2y * k)
+                sp.Closed = True
+            sh = layer.CreateCurve(crv)
+            sh.Fill.ApplyNoFill()
+            oc = app.CreateColor(); oc.RGBAssign(*[int(v) for v in ol['color']])
+            sh.Outline.Color.CopyAssign(oc)                # colour BEFORE width (see patch_outline)
+            sh.Outline.Width = max(float(ol['width_px']) * k, 0.001)
+            sh.Outline.LineJoin = 1
+            made.append(sh)
+        except Exception:  # noqa: BLE001 - an outline is cosmetic, never fail the drawing over it
+            continue
+    if made:
+        try:
+            sr = app.CreateShapeRange()
+            for sh in made:
+                sr.Add(sh)
+            sr.Group()
+        except Exception:  # noqa: BLE001 - grouping is cosmetic
+            pass
+    return len(made), nodes
+
+
+def _dash_style(app, dash_w, gap_w):
+    """The built-in single-dash outline style closest to dash/gap (both in line widths, CorelDRAW's
+    unit for dash patterns). A preset, not OutlineStyles.Add(): Add changes the user's application-wide
+    style list, and COM offers no Remove to undo it."""
+    import math as _m
+    best, best_d = None, 1e9
+    try:
+        styles = app.OutlineStyles
+        for i in range(1, int(styles.Count) + 1):
+            s = styles.Item(i)
+            if int(s.DashCount) != 1:
+                continue
+            d = abs(_m.log(float(s.DashLength(1)) / max(dash_w, 0.5))) + \
+                abs(_m.log(float(s.GapLength(1)) / max(gap_w, 0.5)))
+            if d < best_d:
+                best, best_d = s, d
+    except Exception:  # noqa: BLE001
+        return None
+    return best
+
+
 def draw_rules(app, doc, layer, rules, k, page_h):
     """Graticule / grid rules as editable vector polylines with the source line width and grey."""
     if not rules or not rules.get('polylines'):
         return 0
     col = app.CreateColor(); col.RGBAssign(*[int(v) for v in rules['color']])
     width = float(rules['width_px']) * k
+    style = _dash_style(app, rules['dash'][0] / float(rules['width_px']),
+                        rules['dash'][1] / float(rules['width_px'])) if rules.get('dash') else None
     made = []
     for pl in rules['polylines']:
         pts = [(pl[i] * k, page_h - pl[i + 1] * k) for i in range(0, len(pl), 2)]
@@ -403,6 +492,11 @@ def draw_rules(app, doc, layer, rules, k, page_h):
         for sh in shapes:
             sh.Outline.Width = width
             sh.Outline.Color.CopyAssign(col)
+            if style is not None:
+                try:
+                    sh.Outline.Style = style
+                except Exception:  # noqa: BLE001 - a solid line is still the right line
+                    pass
             made.append(sh)
     if made:
         try:
@@ -492,6 +586,23 @@ def _trace_mask_tiled(app, doc, layer, png_path, page_w, page_h, trace_type, det
     cols, rows = max(1, int(round(W / tile_px))), max(1, int(round(H / tile_px)))
     if cols * rows <= 1:
         return None, (0, 0), 0
+    # A CLOSED ring cut by a seam becomes an open "C", and CorelDRAW fills an open path as if it were
+    # closed: on a flowchart every box border that crossed a seam rendered as a solid black rectangle.
+    # Such a layer is traced whole; repair_lost_ink still puts back thin lines the whole-page trace drops.
+    seams_x = [int((c + 1) * W / cols) for c in range(cols - 1)]
+    seams_y = [int((r + 1) * H / rows) for r in range(rows - 1)]
+    ink = (img < 128).astype(np.uint8)
+    cnts, hier = cv2.findContours(ink, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if hier is not None:
+        for ci, hq in enumerate(hier[0]):
+            if hq[3] >= 0 or cv2.contourArea(cnts[ci]) < 100:
+                continue                          # only outer contours, and only real shapes
+            holes = [q for q, h2 in enumerate(hier[0]) if h2[3] == ci and cv2.contourArea(cnts[q]) >= 50]
+            if not holes:
+                continue                          # not a ring: nothing to be cut open
+            x, y, bw, bh = cv2.boundingRect(cnts[ci])
+            if any(x < sx < x + bw for sx in seams_x) or any(y < sy < y + bh for sy in seams_y):
+                return None, (0, 0), 0
     ov = 6
     made, curves, nodes, used = [], 0, 0, 0
     base = os.path.splitext(png_path)[0]
@@ -561,10 +672,22 @@ def build_color(app, doc, work_dir, font, trace_type, detail, smoothing, fonts=(
         if not rules_drawn and lay['kind'] in ('ink', 'ink_faint'):
             done.append({'layer': 'rules', 'kind': 'rules', 'lines': draw_rules(app, doc, layer, meta.get('rules'), k, page_h)})
             rules_drawn = True
+        if lay['kind'] == 'regions':
+            curves, nodes = draw_regions(app, doc, layer, lay.get('shapes') or [], k, page_h)
+            done.append({'layer': 'regions', 'kind': 'regions', 'curves': curves, 'nodes': nodes})
+            continue
         if lay.get('strokes'):
             # a layer of thin lines: drawn as centerline strokes like the rules, not outline-traced
             done.append({'layer': os.path.basename(lay['file']), 'kind': 'strokes', 'color': lay['color'],
-                         'lines': draw_rules(app, doc, layer, lay['strokes'], k, page_h)})
+                         'lines': draw_rules(app, doc, layer, lay['strokes'], k, page_h),
+                         **({'dash': lay['strokes']['dash']} if lay['strokes'].get('dash') else {})})
+            if lay.get('rest_file'):
+                # the pieces of a dashed layer no line explained: traced like any colour layer
+                png = os.path.join(work_dir, lay['rest_file'].replace('/', os.sep))
+                _, (curves, nodes) = _trace_mask(app, doc, layer, png, page_w, page_h,
+                                                 trace_type, detail, smoothing, lay['color'], None, k)
+                done.append({'layer': os.path.basename(png), 'kind': 'color', 'color': lay['color'],
+                             'curves': curves, 'nodes': nodes})
             continue
         png = os.path.join(work_dir, lay['file'].replace('/', os.sep))
         rgb = lay['color'] if lay['kind'] == 'color' else lay['color']
